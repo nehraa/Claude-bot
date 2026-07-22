@@ -45,10 +45,10 @@ MX_BASE    = "https://api.minimax.io"
 MX_CHAT    = f"{MX_BASE}/anthropic/v1/messages"   # text + vision + video via Anthropic format
 MX_TTS     = f"{MX_BASE}/v1/t2a_v2"
 MX_IMAGE   = f"{MX_BASE}/v1/image_generation"
-MX_MODEL   = os.getenv("MINIMAX_MODEL", "MiniMax-M2.7-highspeed")
-# M2.7-highspeed thinks heavily — needs large max_tokens to leave room after thinking
-# (OpenAI-compatible endpoint /v1/text/chatcompletion_v2 has the same thinking issue
-#  but returns empty content when truncated, so we use Anthropic format which surfaces thinking)
+MX_MODEL   = os.getenv("MINIMAX_MODEL", "MiniMax-M3")
+# M2.7-highspeed thinks heavily (400-800 token thinking block per call).
+# M3 has NO thinking block — returns text directly, ~10x faster.
+# Default max_tokens is generous; M3 uses way less, M2.7 needs the headroom.
 MIN_TOKENS = int(os.getenv("MIN_TOKENS", "8000"))
 
 # Optional: OpenAI-compatible Whisper for STT (MiniMax has no STT)
