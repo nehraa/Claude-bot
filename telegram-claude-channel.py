@@ -23,6 +23,7 @@ import time
 import uuid
 import asyncio
 import logging
+import shlex
 import sqlite3
 import subprocess
 import base64
@@ -66,6 +67,67 @@ OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 CHECKPOINT_EVERY = int(os.getenv("CHECKPOINT_EVERY", "10"))   # checkpoint after N responses
 SILENT_FOR_STEER = int(os.getenv("SILENT_FOR_STEER", "60"))   # sec of no output before asking user
 MAX_MSG_LEN      = 4096
+
+# Telegram MarkdownV2 reserved chars that need escaping when user content is
+# embedded in a parse_mode=MARKDOWN message. Without escaping, a tool_result
+# containing "_" or "*" or "[" makes the entire message fail to parse and the
+# user sees nothing.
+_MDV2_SPECIAL = re.compile(r"([_*\[\]()~`>#+\-=|{}.!\\])")
+
+def md_escape(text: str) -> str:
+    """Escape Telegram MarkdownV2 special characters in untrusted text."""
+    if not text:
+        return ""
+    return _MDV2_SPECIAL.sub(r"\\\1", text)
+
+def md_code_escape(text: str) -> str:
+    """Escape only backticks and backslashes for content inside a ``` block."""
+    if not text:
+        return ""
+    return text.replace("\\", "\\\\").replace("```", "ʼʼʼ")
+
+
+# Map of leading bytes → MIME type for image formats Telegram can send.
+# (We don't need to support every format — just enough that an actual
+# PNG/GIF/WebP photo doesn't get rejected by claude CLI for a wrong MIME.)
+_IMAGE_MAGIC = (
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+    (b"RIFF", "image/webp"),  # RIFF....WEBP — check more carefully below
+    (b"BM", "image/bmp"),
+)
+
+
+def sniff_image_mime(img_bytes: bytes) -> str:
+    """Detect image MIME type from magic bytes. Falls back to image/jpeg."""
+    for magic, mime in _IMAGE_MAGIC:
+        if img_bytes.startswith(magic):
+            if mime == "image/webp" and not img_bytes[8:12] == b"WEBP":
+                return "image/jpeg"  # RIFF but not WEBP — fall through
+            return mime
+    return "image/jpeg"
+
+
+async def safe_send(update, text: str, parse_mode=ParseMode.MARKDOWN, **kwargs):
+    """Send a Telegram message, falling back through MarkdownV2 -> plain text on parse failure.
+
+    Use this for any message that includes user-generated or tool-result content
+    that may contain MarkdownV2 special chars (_, *, [, ], etc.).
+    """
+    bot = update.effective_message.get_bot() if update.effective_message else update.bot
+    chat_id = update.effective_chat.id if update.effective_chat else update.message.chat_id
+    do_quote = kwargs.pop("do_quote", True)
+    try:
+        await bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode, do_quote=do_quote, **kwargs)
+    except Exception as e:
+        # Markdown parse failed — try with everything escaped
+        try:
+            await bot.send_message(chat_id=chat_id, text=md_escape(text), parse_mode=parse_mode, do_quote=do_quote, **kwargs)
+        except Exception:
+            # Still failed — send as plain text
+            await bot.send_message(chat_id=chat_id, text=text, do_quote=do_quote, **kwargs)
 DB_PATH          = Path(__file__).parent / "conversations.db"
 LOG_DIR          = Path(__file__).parent / "data" / "training_log"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -296,6 +358,10 @@ class ClaudeRunner:
         self._send_to_user_fn: Optional[Callable] = None
         self._user_chat: Any | None = None  # telegram Chat object for steering question
         self._running = False
+        # Serialize all writes to claude's stdin. Without this, concurrent
+        # inject_prompt() calls interleave at the byte level and corrupt the
+        # JSON stream — claude CLI then hangs or crashes mid-session.
+        self._stdin_lock = asyncio.Lock()
         # Configurable flags (set via /agent, /add-dir, /model, /effort, /cd)
         self.config: dict = {
             "model": CLAUDE_MODEL,
@@ -356,6 +422,30 @@ class ClaudeRunner:
         # Start streaming stdout
         self._stdout_task = asyncio.create_task(self._read_stdout())
 
+        # Surface early failures: if claude CLI exits within 2s (bad model name,
+        # missing --bare flag, auth error, etc.), tell the user instead of
+        # silently leaving them with a session that never produces output.
+        try:
+            await asyncio.wait_for(self.process.wait(), timeout=2.0)
+            # Process exited — read stderr and report
+            stderr = b""
+            try:
+                stderr = await self.process.stderr.read() if self.process.stderr else b""
+            except Exception:
+                pass
+            err_text = stderr.decode("utf-8", errors="replace").strip()[-500:]
+            log_event("runner_early_exit", self.chat_id, {
+                "returncode": self.process.returncode,
+                "stderr": err_text,
+            })
+            if self._send_to_user_fn:
+                await self._send_to_user_fn(
+                    f"❌ claude exited immediately (code {self.process.returncode})\n{err_text}"
+                )
+        except asyncio.TimeoutError:
+            # Normal: process is still running after 2s
+            pass
+
     def _build_cmd(self) -> list[str]:
         """Build the claude CLI command from current config."""
         cmd = [
@@ -381,15 +471,25 @@ class ClaudeRunner:
             cmd += ["--permission-mode", self.config["permission_mode"]]
         if self.config.get("append_system_prompt"):
             cmd += ["--append-system-prompt", self.config["append_system_prompt"]]
-        cmd += CLAUDE_EXTRA_ARGS.split()
+        # shlex.split respects quoted values ("--system-prompt 'my prompt.md'")
+        # while .split() would mangle the quoted path into 3 tokens.
+        cmd += shlex.split(CLAUDE_EXTRA_ARGS)
         return cmd
 
     async def restart_with_config(self, new_config: dict, send_fn):
         """Stop the current subprocess, apply new config, restart with the same goal.
         Used when user changes /model, /agent, /add-dir etc mid-session."""
+        # Drain any steering messages queued during the restart window — they
+        # were addressed at the OLD session and would be sent as the first
+        # user message of the NEW session, polluting its history.
+        dropped = self._pending_inject
+        self._pending_inject = []
         if self._running:
             await send_fn("🔄 restarting session with new config…")
-            log_event("runner_restart", self.chat_id, {"new_config": new_config})
+            log_event("runner_restart", self.chat_id, {
+                "new_config": new_config,
+                "dropped_pending_injects": dropped,
+            })
             await self.stop()
         # Update config
         for k, v in new_config.items():
@@ -398,6 +498,9 @@ class ClaudeRunner:
         # New session id (because --resume points to old session)
         if not self.config.get("resume"):
             self.session_id = str(uuid.uuid4())
+        # Reset response counter so the new session doesn't fire a premature
+        # checkpoint on its first response (counter was carried over from old).
+        self.response_count = 0
         # Restart
         await self.start(self.goal, send_fn, self._user_chat)
 
@@ -418,11 +521,12 @@ class ClaudeRunner:
             content = [{"type": "text", "text": content}]
         msg = {"type": "user", "message": {"role": "user", "content": content}}
         line = json.dumps(msg) + "\n"
-        try:
-            self.process.stdin.write(line.encode("utf-8"))
-            await self.process.stdin.drain()
-        except Exception as e:
-            log_event("inject_error", self.chat_id, {"error": str(e)})
+        async with self._stdin_lock:
+            try:
+                self.process.stdin.write(line.encode("utf-8"))
+                await self.process.stdin.drain()
+            except Exception as e:
+                log_event("inject_error", self.chat_id, {"error": str(e)})
 
     async def start_multimodal(self, content: list, send_fn, user_chat):
         """Start a session with multi-part content (text + images).
@@ -552,7 +656,7 @@ class ClaudeRunner:
                         content = "\n".join(b.get("text", "") for b in content if b.get("type") == "text")
                     preview = (content or "")[:1500]
                     if preview.strip():
-                        await send_fn(f"📥 tool result:\n```\n{preview}\n```")
+                        await send_fn(f"📥 tool result:\n```\n{md_code_escape(preview)}\n```")
                         log_event("tool_result", self.chat_id, {"content": preview[:500]})
             return
 
@@ -1581,7 +1685,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     if not update.message.photo:
         return
-    await _consume_pending_goal(chat_id)
+    # Clear (not consume) the pending /new goal so the next typed text still wins
+    # as the goal. Photo/voice don't act as a goal themselves.
+    await _clear_pending_goal(chat_id)
     await update.message.reply_text("📷 downloading…", do_quote=True)
 
     try:
@@ -1591,6 +1697,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await file.download_to_memory(buf)
         img_bytes = buf.getvalue()
         img_b64 = base64.b64encode(img_bytes).decode()
+        img_mime = sniff_image_mime(img_bytes)
 
         async with _runs_lock:
             runner = _active_runs.get(chat_id)
@@ -1604,14 +1711,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "type": "image",
                     "source": {
                         "type": "base64",
-                        "media_type": "image/jpeg",
+                        "media_type": img_mime,
                         "data": img_b64,
                     },
                 },
             ]
             runner._pending_inject.append(content)  # type: ignore[arg-type]
             runner._inject_event.set()
-            log_event("user_image", chat_id, {"caption": caption, "size": len(img_bytes)})
+            log_event("user_image", chat_id, {"caption": caption, "size": len(img_bytes), "mime": img_mime})
             await update.message.reply_text("↪️ image injected into session", do_quote=True)
         else:
             # No active session — start one with the image as initial context
@@ -1622,7 +1729,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "type": "image",
                     "source": {
                         "type": "base64",
-                        "media_type": "image/jpeg",
+                        "media_type": img_mime,
                         "data": img_b64,
                     },
                 },
@@ -1654,13 +1761,15 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     api_key = WHISPER_API_KEY or OPENAI_API_KEY
     if not api_key:
-        await _consume_pending_goal(chat_id)
+        # Clear (not consume) the pending /new goal so the next typed text still wins
+        await _clear_pending_goal(chat_id)
         await update.message.reply_text(
             "voice transcription requires WHISPER_API_KEY or OPENAI_API_KEY in .env",
             do_quote=True,
         )
         return
-    await _consume_pending_goal(chat_id)
+    # Clear (not consume) the pending /new goal so the next typed text still wins
+    await _clear_pending_goal(chat_id)
     await update.message.reply_text("🎙 transcribing…", do_quote=True)
     try:
         voice = update.message.voice
