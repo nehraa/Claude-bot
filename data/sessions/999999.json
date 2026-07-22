@@ -1,0 +1,14 @@
+{
+  "goal": "say PONG",
+  "user_intent": "",
+  "decisions_made": [],
+  "current_understanding": "",
+  "last_responses": [
+    {
+      "ts": 1784741327.860088,
+      "text": "PONG"
+    }
+  ],
+  "checkpoint_count": 0,
+  "steering_history": []
+}

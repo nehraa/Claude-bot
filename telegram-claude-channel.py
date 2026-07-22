@@ -789,6 +789,30 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     log_msg(chat_id, "user", prompt, "text")
     log_event("user_message", chat_id, {"text": prompt, "user_id": user.id if user else None})
 
+    # If user just ran `/new` with no goal, this next text is the goal
+    if context.user_data.pop("awaiting_new_goal", False):
+        await update.message.reply_text(
+            f"🆕 starting new session with goal: _{prompt}_",
+            do_quote=True, parse_mode=ParseMode.MARKDOWN,
+        )
+        log_event("new_session", chat_id, {"goal": prompt, "via": "interactive_prompt"})
+
+        async def send_fn(text):
+            try:
+                await update.message.reply_text(text, do_quote=False, parse_mode=ParseMode.MARKDOWN)
+            except Exception:
+                await update.message.reply_text(text, do_quote=False)
+
+        async with _runs_lock:
+            old = _active_runs.get(chat_id)
+            if old is not None:
+                await old.stop()
+                _active_runs.pop(chat_id, None)
+            runner = ClaudeRunner(chat_id, _steer_manager)
+            _active_runs[chat_id] = runner
+            await runner.start(prompt, send_fn, update.message.chat)
+        return
+
     async with _runs_lock:
         runner = _active_runs.get(chat_id)
 
@@ -943,17 +967,56 @@ async def _stop_runner(chat_id):
     return None
 
 
+HELP_TEXT = (
+    "🤖 *Claude-bot v3 — full Claude Code parity over Telegram*\n\n"
+    "*Conversation:*\n"
+    "• Send a message → starts a persistent Claude session for this chat\n"
+    "• Send another while running → injected as a *steering input*\n"
+    "• Send a photo → analyzed + injected into session (Anthropic vision)\n"
+    "• Send a voice note → Whisper transcribes + injects text\n"
+    "• Every 10 responses: auto-checkpoint + steering check\n\n"
+    "*Session control:*\n"
+    "`/new <goal>` — start a fresh session with the given goal\n"
+    "`/resume <id>` — resume a saved claude session (use `/sessions` to list)\n"
+    "`/fork` — fork current session into an independent branch\n"
+    "`/cancel` — stop the running session\n"
+    "`/status` — session state, checkpoint, current config\n"
+    "`/pwd` — show bot cwd + claude cwd + config\n\n"
+    "*Directory navigation:*\n"
+    "`/cd <path>` — change claude's working directory (restarts session)\n"
+    "`/ls [path]` — list directory contents (defaults to claude cwd)\n"
+    "`/tree [depth] [path]` — show directory tree (default depth 2)\n"
+    "`/here` — add current cwd to `--add-dir` (gives claude write access)\n"
+    "`/adddir <path>` — give claude access to an extra directory\n\n"
+    "*Claude config (each restarts session):*\n"
+    "`/model <name>` — switch model (`sonnet`, `opus`, full name)\n"
+    "`/agent <name>` — use a subagent (`Explore`, `Plan`, `general-purpose`)\n"
+    "`/effort <low|medium|high|xhigh|max>` — reasoning effort\n\n"
+    "*Tools (one-shot, no session):*\n"
+    "`/imagine <prompt>` — generate image (MiniMax)\n"
+    "`/speak <text>` — text-to-speech (MiniMax)\n"
+)
+
+
 async def handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """`/new [goal]` — stop current session, start a new one with optional goal."""
+    """`/new [goal]` — show menu + start a new session (goal optional)."""
     chat_id = update.message.chat_id
     raw = update.message.text.split(maxsplit=1)
     goal = raw[1].strip() if len(raw) > 1 else ""
     if not goal:
-        await update.message.reply_text("Usage: `/new <initial goal>`", do_quote=True, parse_mode=ParseMode.MARKDOWN)
+        # Show command menu + ask for goal interactively
+        await update.message.reply_text(
+            HELP_TEXT + "\n\n💬 *Reply with your goal* for the new session\n"
+            "_(or send `/new <goal>` in one message to skip this prompt)_",
+            do_quote=True, parse_mode=ParseMode.MARKDOWN,
+        )
+        # Set state so next text message becomes the new-session goal
+        context.user_data["awaiting_new_goal"] = True
         return
 
     await update.message.reply_text("🆕 starting new session…", do_quote=True)
     log_event("new_session", chat_id, {"goal": goal})
+    context.user_data.pop("awaiting_new_goal", None)
 
     async def send_fn(text):
         try:
@@ -1601,37 +1664,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 *Claude-bot v3 — full Claude Code parity over Telegram*\n\n"
-        "*Conversation:*\n"
-        "• Send a message → starts a persistent Claude session for this chat\n"
-        "• Send another while running → injected as a *steering input*\n"
-        "• Send a photo → analyzed + injected into session (Anthropic vision)\n"
-        "• Send a voice note → Whisper transcribes + injects text\n"
-        "• Every 10 responses: auto-checkpoint + steering check\n\n"
-        "*Session control:*\n"
-        "`/new <goal>` — start a fresh session with the given goal\n"
-        "`/resume <id>` — resume a saved claude session (use `/sessions` to list)\n"
-        "`/fork` — fork current session into an independent branch\n"
-        "`/cancel` — stop the running session\n"
-        "`/status` — session state, checkpoint, current config\n"
-        "`/pwd` — show bot cwd + claude cwd + config\n\n"
-        "*Directory navigation:*\n"
-        "`/cd <path>` — change claude's working directory (restarts session)\n"
-        "`/ls [path]` — list directory contents (defaults to claude cwd)\n"
-        "`/tree [depth] [path]` — show directory tree (default depth 2)\n"
-        "`/here` — add current cwd to `--add-dir` (gives claude write access)\n"
-        "`/adddir <path>` — give claude access to an extra directory\n\n"
-        "*Claude config (each restarts session):*\n"
-        "`/model <name>` — switch model (`sonnet`, `opus`, full name)\n"
-        "`/agent <name>` — use a subagent (`Explore`, `Plan`, `general-purpose`)\n"
-        "`/effort <low|medium|high|xhigh|max>` — reasoning effort\n\n"
-        "*Tools (one-shot, no session):*\n"
-        "`/imagine <prompt>` — generate image (MiniMax)\n"
-        "`/speak <text>` — text-to-speech (MiniMax)\n",
-        do_quote=True,
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    await update.message.reply_text(HELP_TEXT, do_quote=True, parse_mode=ParseMode.MARKDOWN)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1680,7 +1713,7 @@ def main():
     print(f"  Session state dir = {SESSION_DIR}", flush=True)
     print(f"  DB                = {DB_PATH}", flush=True)
 
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=False)
 
 
 if __name__ == "__main__":
