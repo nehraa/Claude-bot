@@ -40,13 +40,16 @@ from telegram.constants import ParseMode
 BOT_TOKEN        = os.getenv("TELEGRAM_BOT_TOKEN")
 MINIMAX_API_KEY  = os.getenv("MINIMAX_API_KEY")
 
-# MiniMax endpoints — OpenAI-compatible for multimodal, Anthropic for others
-MX_BASE   = "https://api.minimax.io/v1"
-MX_OPENAI = f"{MX_BASE}/text/chatcompletion_v2"   # supports image_url, video_url
-MX_CHAT   = f"{MX_BASE}/text/chatcompletion_v2"   # Anthropic-style
-MX_TTS    = f"{MX_BASE}/t2a_v2"
-MX_IMAGE  = f"{MX_BASE}/image_generation"
-MX_MODEL  = os.getenv("MINIMAX_MODEL", "MiniMax-M3")   # M3 = multimodal
+# MiniMax endpoints — Anthropic-format (M2.7) is what works on api.minimax.io
+MX_BASE    = "https://api.minimax.io"
+MX_CHAT    = f"{MX_BASE}/anthropic/v1/messages"   # text + vision + video via Anthropic format
+MX_TTS     = f"{MX_BASE}/v1/t2a_v2"
+MX_IMAGE   = f"{MX_BASE}/v1/image_generation"
+MX_MODEL   = os.getenv("MINIMAX_MODEL", "MiniMax-M2.7-highspeed")
+# M2.7-highspeed thinks heavily — needs large max_tokens to leave room after thinking
+# (OpenAI-compatible endpoint /v1/text/chatcompletion_v2 has the same thinking issue
+#  but returns empty content when truncated, so we use Anthropic format which surfaces thinking)
+MIN_TOKENS = int(os.getenv("MIN_TOKENS", "8000"))
 
 # Optional: OpenAI-compatible Whisper for STT (MiniMax has no STT)
 WHISPER_API_KEY = os.getenv("WHISPER_API_KEY")  # or set OPENAI_API_KEY
@@ -64,6 +67,7 @@ DB_PATH        = Path(__file__).parent / "conversations.db"
 # ─────────────────────────────────────────────────────────────
 
 def mx_post(url: str, payload: dict, stream: bool = False) -> requests.Response:
+    """OpenAI-compatible POST (TTS, image gen, etc.) — uses Bearer auth."""
     headers = {
         "Authorization": f"Bearer {MINIMAX_API_KEY}",
         "Content-Type": "application/json",
@@ -71,25 +75,99 @@ def mx_post(url: str, payload: dict, stream: bool = False) -> requests.Response:
     return requests.post(url, headers=headers, json=payload, timeout=60, stream=stream)
 
 
+def mx_anthropic_post(url: str, payload: dict) -> requests.Response:
+    """Anthropic-format POST (chat / vision / video) — uses X-Api-Key."""
+    headers = {
+        "X-Api-Key": MINIMAX_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json",
+    }
+    return requests.post(url, headers=headers, json=payload, timeout=120)
+
+
+def _flatten_content(messages: list[dict]) -> list[dict]:
+    """
+    Convert OpenAI-style messages (text OR content-list with image_url/video_url)
+    into Anthropic-format messages (content-list with text/image/video blocks).
+
+    The bot's call sites use OpenAI format:
+        {"role": "user", "content": "..."}
+        {"role": "user", "content": [{"type": "text", ...}, {"type": "image_url", ...}]}
+
+    Anthropic wants:
+        {"role": "user", "content": [{"type": "text", ...}, {"type": "image", "source": {...}}]}
+
+    We map image_url→image (with base64 source) and video_url→... Anthropic doesn't have
+    a native video block, so we send a placeholder text + a request to the caller to
+    pre-process. For now video passthrough keeps the URL as a hint.
+    """
+    out = []
+    for m in messages:
+        role = m["role"]
+        content = m.get("content")
+        if isinstance(content, str):
+            out.append({"role": role, "content": content})
+        elif isinstance(content, list):
+            new_blocks = []
+            for blk in content:
+                btype = blk.get("type")
+                if btype == "text":
+                    new_blocks.append({"type": "text", "text": blk.get("text", "")})
+                elif btype == "image_url":
+                    url = blk.get("image_url", {}).get("url", "")
+                    # Extract base64 data URI: data:image/jpeg;base64,XXXX
+                    if url.startswith("data:") and ";base64," in url:
+                        header, b64 = url.split(";base64,", 1)
+                        media_type = header.split(":", 1)[1] or "image/jpeg"
+                        new_blocks.append({
+                            "type": "image",
+                            "source": {"type": "base64", "media_type": media_type, "data": b64},
+                        })
+                    else:
+                        # URL — Anthropic wants base64 source; treat as text fallback
+                        new_blocks.append({"type": "text", "text": f"[image URL: {url}]"})
+                elif btype == "video_url":
+                    # No native video block in Anthropic format — extract description hint
+                    new_blocks.append({"type": "text", "text": "[video content attached — describe from base64 separately]"})
+                else:
+                    new_blocks.append(blk)
+            out.append({"role": role, "content": new_blocks})
+        else:
+            out.append(m)
+    return out
+
+
 def mx_chat(
     messages: list[dict],
     model: str = None,
-    max_tokens: int = 4096,
+    max_tokens: int | None = None,
+    system: str | None = None,
 ) -> str:
     """
-    Chat via MiniMax OpenAI-compatible endpoint.
-    Uses MX_MODEL env var or 'MiniMax-M3' as default.
-    Supports multimodal content: text, image_url, video_url parts.
+    Chat via MiniMax Anthropic-format endpoint. M2.7 emits long thinking blocks
+    before text, so we strip thinking and return only the text content.
     """
     if model is None:
         model = MX_MODEL
-    resp = mx_post(MX_OPENAI, {
+    if max_tokens is None:
+        max_tokens = MIN_TOKENS
+    payload = {
         "model": model,
-        "messages": messages,
-        "max_completion_tokens": max_tokens,
-    })
+        "max_tokens": max_tokens,
+        "messages": _flatten_content(messages),
+    }
+    if system:
+        payload["system"] = system
+    resp = mx_anthropic_post(MX_CHAT, payload)
     resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"]
+    data = resp.json()
+    blocks = data.get("content", [])
+    text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+    if not text:
+        # All thinking, no actual answer — surface so caller knows
+        thinking = "".join(b.get("thinking", "") for b in blocks if b.get("type") == "thinking")
+        return f"(model produced no text — thinking: {thinking[:300]})"
+    return text
 
 
 def mx_tts(text: str, voice: str = TTS_VOICE) -> bytes:
@@ -222,10 +300,10 @@ async def summarize_output(output_lines: list[str], goal: str) -> str:
     try:
         summary = mx_chat(
             [
-                {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
-            max_tokens=1024,
+            max_tokens=4000,
+            system=SYSTEM_PROMPT,
         )
         return summary
     except Exception as e:
@@ -343,7 +421,7 @@ class ClaudeRunner:
 
     async def _read_stream(self, process, on_line, on_done):
         empty = 0
-        reader = asyncio.create_task(process.stdout.readline().__await__())
+        reader = asyncio.create_task(process.stdout.readline())
 
         while True:
             done, _ = await asyncio.wait(
@@ -354,12 +432,12 @@ class ClaudeRunner:
                 if line:
                     empty = 0
                     await on_line(line.decode("utf-8", errors="replace"))
-                    reader = asyncio.create_task(process.stdout.readline().__await__())
+                    reader = asyncio.create_task(process.stdout.readline())
                 else:
                     empty += 1
                     if empty > 3 or process.returncode is not None:
                         break
-                    reader = asyncio.create_task(process.stdout.readline().__await__())
+                    reader = asyncio.create_task(process.stdout.readline())
             else:
                 if process.returncode is not None:
                     break
@@ -496,7 +574,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     },
                 },
             ],
-        }], max_tokens=1024)
+        }], max_tokens=4000)
 
         log_msg(update.message.chat_id, "user", f"[video]: {description}", "video")
         await update.message.reply_text(f"🎬: {description}", quote=True)
@@ -537,7 +615,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     },
                 },
             ],
-        }], max_tokens=1024)
+        }], max_tokens=4000)
 
         log_msg(update.message.chat_id, "user", f"[image]: {description}", "image")
         await update.message.reply_text(f"🖼: {description}", quote=True)

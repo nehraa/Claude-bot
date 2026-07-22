@@ -1,0 +1,9 @@
+.env
+.env.local
+venv/
+__pycache__/
+*.pyc
+conversations.db
+conversations.db-journal
+*.log
+.qwen/
