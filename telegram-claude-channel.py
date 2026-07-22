@@ -196,10 +196,11 @@ def mx_tts(text: str, voice: str = TTS_VOICE) -> bytes:
     resp.raise_for_status()
     data = resp.json()
 
-    # Response: { "id": "...", "data": { "audio_url": "..." } }
-    audio_url = data.get("data", {}).get("audio_url")
+    # Response: { "data": { "audio": "<url>", "status": 2, ... } }
+    # Field name is 'audio' (not 'audio_url' as the original code assumed).
+    audio_url = data.get("data", {}).get("audio") or data.get("data", {}).get("audio_url")
     if not audio_url:
-        raise ValueError(f"No audio_url in TTS response: {data}")
+        raise ValueError(f"No audio URL in TTS response: {data}")
 
     # Download the audio
     audio_resp = requests.get(audio_url, timeout=30)
@@ -712,8 +713,8 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "🤖 *Claude Code Telegram Bridge*\n\n"
         "📝 Send a message → Claude Code runs, status reports stream back\n"
-        "🖼 Send a photo → MiniMax M3 vision describes it, Claude analyzes\n"
-        "🎬 Send a video → MiniMax M3 multimodal understanding, Claude analyzes\n"
+        "🖼 Send a photo → MiniMax M2.7 vision describes it, Claude analyzes\n"
+        "🎬 Send a video → handled via base64 description, Claude analyzes (experimental)\n"
         "🎙 Send voice → transcribed via Whisper, Claude responds\n"
         "🎨 `/imagine <prompt>` → MiniMax image generation\n"
         "🔊 `/speak <text>` → MiniMax TTS audio reply\n\n"
