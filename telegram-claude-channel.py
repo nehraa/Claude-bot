@@ -57,6 +57,11 @@ MIN_TOKENS = int(os.getenv("MIN_TOKENS", "4000"))
 CLAUDE_COMMAND = os.getenv("CLAUDE_COMMAND", "claude")
 CLAUDE_MODEL    = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5-20250929")
 CLAUDE_EXTRA_ARGS = os.getenv("CLAUDE_EXTRA_ARGS", "--bare --verbose --dangerously-skip-permissions")
+# Persisted session dir (used by /resume, /sessions, /fork)
+CLAUDE_PROJECTS_DIR = Path(os.path.expanduser("~/.claude/projects"))
+WHISPER_API_KEY = os.getenv("WHISPER_API_KEY", "")
+OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY", "")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 
 CHECKPOINT_EVERY = int(os.getenv("CHECKPOINT_EVERY", "10"))   # checkpoint after N responses
 SILENT_FOR_STEER = int(os.getenv("SILENT_FOR_STEER", "60"))   # sec of no output before asking user
@@ -143,7 +148,45 @@ def mx_image(prompt: str, aspect_ratio: str = "16:9") -> bytes:
 # ─────────────────────────────────────────────────────────────
 
 def init_db():
+    """Initialize DB schema. Drops + recreates sessions table if schema is stale.
+    (The messages table is preserved — it has real history.)"""
     conn = sqlite3.connect(DB_PATH)
+    # Check if sessions table has the new schema
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()]
+    needs_recreate = cols and (
+        "claude_session_id" not in cols or "last_active" not in cols or "message_count" not in cols
+    )
+    if needs_recreate:
+        # Backup old data, recreate
+        conn.execute("ALTER TABLE sessions RENAME TO sessions_old")
+        conn.execute("""
+            CREATE TABLE sessions (
+                chat_id   INTEGER PRIMARY KEY,
+                claude_session_id TEXT,
+                goal      TEXT,
+                last_active DATETIME DEFAULT CURRENT_TIMESTAMP,
+                message_count INTEGER DEFAULT 0
+            )
+        """)
+        # Migrate any old rows (best-effort)
+        try:
+            conn.execute("""
+                INSERT OR IGNORE INTO sessions (chat_id, goal, last_active, message_count)
+                SELECT chat_id, goal, started, 0 FROM sessions_old
+            """)
+        except Exception:
+            pass
+        conn.execute("DROP TABLE sessions_old")
+        conn.commit()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            chat_id   INTEGER PRIMARY KEY,
+            claude_session_id TEXT,
+            goal      TEXT,
+            last_active DATETIME DEFAULT CURRENT_TIMESTAMP,
+            message_count INTEGER DEFAULT 0
+        )
+    """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -152,15 +195,6 @@ def init_db():
             content TEXT,
             media   TEXT DEFAULT 'text',
             ts      DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS sessions (
-            chat_id   INTEGER PRIMARY KEY,
-            claude_session_id TEXT,
-            goal      TEXT,
-            last_active DATETIME DEFAULT CURRENT_TIMESTAMP,
-            message_count INTEGER DEFAULT 0
         )
     """)
     conn.commit()
@@ -257,11 +291,23 @@ class ClaudeRunner:
         self.last_event_ts: float = 0.0
         self.steer_asked_at: float = 0.0
         self._stdout_task: asyncio.Task | None = None
-        self._pending_inject: list[str] = []
+        self._pending_inject: list = []  # each item is str OR list[dict] (Anthropic content blocks)
         self._inject_event = asyncio.Event()
         self._send_to_user_fn: Optional[Callable] = None
         self._user_chat: Any | None = None  # telegram Chat object for steering question
         self._running = False
+        # Configurable flags (set via /agent, /add-dir, /model, /effort)
+        self.config: dict = {
+            "model": CLAUDE_MODEL,
+            "add_dirs": [],        # list of paths → --add-dir
+            "agent": None,         # → --agent
+            "agents": None,        # → --agents (json string)
+            "effort": None,        # → --effort (low/medium/high/xhigh/max)
+            "permission_mode": None,  # → --permission-mode
+            "append_system_prompt": None,
+            "resume": None,        # → --resume <id> (start by resuming)
+            "fork_session": False, # → --fork-session
+        }
 
     async def start(self, goal: str, send_fn, user_chat):
         """Spawn the claude subprocess, send initial goal, start streaming output."""
@@ -270,28 +316,30 @@ class ClaudeRunner:
         self._user_chat = user_chat
         self._running = True
 
-        # Build claude command
-        cmd = [
-            CLAUDE_COMMAND, "--print",
-            "--input-format", "stream-json",
-            "--output-format", "stream-json",
-            "--session-id", self.session_id,
-            "--model", CLAUDE_MODEL,
-        ] + CLAUDE_EXTRA_ARGS.split()
+        # Build claude command from current config
+        cmd = self._build_cmd()
 
         log_event("runner_start", self.chat_id, {
             "session_id": self.session_id,
             "goal": goal,
             "cmd": " ".join(cmd),
+            "config": self.config,
         })
 
-        self.process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env={**os.environ, "NO_COLOR": "1", "CLAUDE_CODE_SIMPLE": "1"},
-        )
+        try:
+            self.process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env={**os.environ, "NO_COLOR": "1", "CLAUDE_CODE_SIMPLE": "1"},
+            )
+        except FileNotFoundError as e:
+            log_event("runner_start_failed", self.chat_id, {"error": str(e)})
+            self._running = False
+            if self._send_to_user_fn:
+                await self._send_to_user_fn(f"❌ failed to start claude: {e}")
+            return
 
         upsert_session(self.chat_id, self.session_id, goal)
         log_msg(self.chat_id, "user", f"[goal] {goal}", "goal")
@@ -302,6 +350,51 @@ class ClaudeRunner:
         # Start streaming stdout
         self._stdout_task = asyncio.create_task(self._read_stdout())
 
+    def _build_cmd(self) -> list[str]:
+        """Build the claude CLI command from current config."""
+        cmd = [
+            CLAUDE_COMMAND, "--print",
+            "--input-format", "stream-json",
+            "--output-format", "stream-json",
+            "--session-id", self.session_id,
+            "--model", self.config["model"],
+        ]
+        if self.config.get("resume"):
+            cmd += ["--resume", self.config["resume"]]
+        if self.config.get("fork_session"):
+            cmd += ["--fork-session"]
+        for d in self.config.get("add_dirs", []):
+            cmd += ["--add-dir", d]
+        if self.config.get("agent"):
+            cmd += ["--agent", self.config["agent"]]
+        if self.config.get("agents"):
+            cmd += ["--agents", self.config["agents"]]
+        if self.config.get("effort"):
+            cmd += ["--effort", self.config["effort"]]
+        if self.config.get("permission_mode"):
+            cmd += ["--permission-mode", self.config["permission_mode"]]
+        if self.config.get("append_system_prompt"):
+            cmd += ["--append-system-prompt", self.config["append_system_prompt"]]
+        cmd += CLAUDE_EXTRA_ARGS.split()
+        return cmd
+
+    async def restart_with_config(self, new_config: dict, send_fn):
+        """Stop the current subprocess, apply new config, restart with the same goal.
+        Used when user changes /model, /agent, /add-dir etc mid-session."""
+        if self._running:
+            await send_fn("🔄 restarting session with new config…")
+            log_event("runner_restart", self.chat_id, {"new_config": new_config})
+            await self.stop()
+        # Update config
+        for k, v in new_config.items():
+            if k in self.config:
+                self.config[k] = v
+        # New session id (because --resume points to old session)
+        if not self.config.get("resume"):
+            self.session_id = str(uuid.uuid4())
+        # Restart
+        await self.start(self.goal, send_fn, self._user_chat)
+
     async def inject_prompt(self, prompt: str):
         """Queue a prompt to be sent to claude on next opportunity.
         Use this for steering interventions from the user."""
@@ -310,10 +403,13 @@ class ClaudeRunner:
         self._pending_inject.append(prompt)
         self._inject_event.set()
 
-    async def _send_prompt(self, content: str):
-        """Write a user-message JSON to claude's stdin."""
+    async def _send_prompt(self, content):
+        """Write a user-message JSON to claude's stdin.
+        content can be a string OR a list of content blocks (Anthropic format)."""
         if not self.process or self.process.stdin.is_closing():
             return
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}]
         msg = {"type": "user", "message": {"role": "user", "content": content}}
         line = json.dumps(msg) + "\n"
         try:
@@ -321,6 +417,45 @@ class ClaudeRunner:
             await self.process.stdin.drain()
         except Exception as e:
             log_event("inject_error", self.chat_id, {"error": str(e)})
+
+    async def start_multimodal(self, content: list, send_fn, user_chat):
+        """Start a session with multi-part content (text + images).
+        Like start() but with Anthropic-format content list as initial prompt."""
+        self.goal = "(multimodal prompt)"
+        self._send_to_user_fn = send_fn
+        self._user_chat = user_chat
+        self._running = True
+
+        cmd = self._build_cmd()
+        log_event("runner_start_multimodal", self.chat_id, {
+            "session_id": self.session_id,
+            "cmd": " ".join(cmd),
+            "config": self.config,
+        })
+
+        try:
+            self.process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env={**os.environ, "NO_COLOR": "1", "CLAUDE_CODE_SIMPLE": "1"},
+            )
+        except FileNotFoundError as e:
+            log_event("runner_start_failed", self.chat_id, {"error": str(e)})
+            self._running = False
+            if self._send_to_user_fn:
+                await self._send_to_user_fn(f"❌ failed to start claude: {e}")
+            return
+
+        upsert_session(self.chat_id, self.session_id, "(multimodal)")
+        log_msg(self.chat_id, "user", "[multimodal prompt]", "image")
+
+        # Send the multi-part content directly
+        await self._send_prompt(content)
+
+        # Start streaming stdout
+        self._stdout_task = asyncio.create_task(self._read_stdout())
 
     async def _flush_pending_injects(self):
         """If user sent prompts while claude was running, send them now."""
@@ -724,11 +859,11 @@ async def handle_tts(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     row = get_session_row(chat_id)
-    if not row:
-        await update.message.reply_text("no session yet", do_quote=True)
-        return
-    state_path = SESSION_DIR / f"{chat_id}.json"
+    async with _runs_lock:
+        runner = _active_runs.get(chat_id)
+
     state_summary = ""
+    state_path = SESSION_DIR / f"{chat_id}.json"
     if state_path.exists():
         try:
             st = json.loads(state_path.read_text())
@@ -739,11 +874,33 @@ async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception:
             pass
+
+    config_summary = ""
+    if runner:
+        c = runner.config
+        dirs = ", ".join(c.get("add_dirs", [])) or "(none)"
+        config_summary = (
+            f"\n\n⚙️ *Config*:"
+            f"\n  model: `{c.get('model', CLAUDE_MODEL)}`"
+            f"\n  agent: `{c.get('agent') or '(default)'}`"
+            f"\n  add-dirs: {dirs}"
+            f"\n  effort: `{c.get('effort') or '(default)'}`"
+            f"\n  resume: `{c.get('resume') or '(new session)'}`"
+            f"\n  responses so far: {runner.response_count}"
+            f"\n  running: {'✅' if runner._running else '❌'}"
+        )
+    elif row:
+        config_summary = f"\n🆔 Last session: `{row[1]}` (use `/resume {row[1][:8]}…` to continue)"
+
+    if not row and not runner:
+        await update.message.reply_text("no session yet", do_quote=True)
+        return
+
     await update.message.reply_text(
-        f"🆔 Session: `{row[1]}`\n"
-        f"💬 Messages: {row[4]}\n"
-        f"🕐 Last active: {row[3]}"
-        f"{state_summary}",
+        f"💬 Messages: {row[4] if row else 0}\n"
+        f"🕐 Last active: {row[3] if row else 'n/a'}"
+        f"{state_summary}"
+        f"{config_summary}",
         do_quote=True,
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -762,16 +919,475 @@ async def handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("no active session", do_quote=True)
 
 
+# ─────────────────────────────────────────────────────────────
+# Slash commands — full Claude Code parity
+# ─────────────────────────────────────────────────────────────
+
+async def _get_or_create_runner(update, chat_id, send_fn):
+    """Get the active runner, or return None if no session exists."""
+    async with _runs_lock:
+        return _active_runs.get(chat_id)
+
+
+async def _stop_runner(chat_id):
+    async with _runs_lock:
+        runner = _active_runs.get(chat_id)
+        if runner:
+            await runner.stop()
+            _active_runs.pop(chat_id, None)
+            return runner
+    return None
+
+
+async def handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/new [goal]` — stop current session, start a new one with optional goal."""
+    chat_id = update.message.chat_id
+    raw = update.message.text.split(maxsplit=1)
+    goal = raw[1].strip() if len(raw) > 1 else ""
+    if not goal:
+        await update.message.reply_text("Usage: `/new <initial goal>`", do_quote=True, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    await update.message.reply_text("🆕 starting new session…", do_quote=True)
+    log_event("new_session", chat_id, {"goal": goal})
+
+    async def send_fn(text):
+        try:
+            await update.message.reply_text(text, do_quote=False, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await update.message.reply_text(text, do_quote=False)
+
+    # Stop old, start new
+    await _stop_runner(chat_id)
+    async with _runs_lock:
+        runner = ClaudeRunner(chat_id, _steer_manager)
+        _active_runs[chat_id] = runner
+        await runner.start(goal, send_fn, update.message.chat)
+
+
+async def handle_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/resume <session_id>` — resume a saved claude session."""
+    chat_id = update.message.chat_id
+    raw = update.message.text.split(maxsplit=1)
+    if len(raw) < 2 or not raw[1].strip():
+        await update.message.reply_text(
+            "Usage: `/resume <claude-session-id>`\n"
+            "Use `/sessions` to list available sessions.",
+            do_quote=True, parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    target = raw[1].strip()
+
+    await update.message.reply_text(f"↩️ resuming session `{target[:8]}…`", do_quote=True)
+    log_event("resume_session", chat_id, {"target": target})
+
+    async def send_fn(text):
+        try:
+            await update.message.reply_text(text, do_quote=False, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await update.message.reply_text(text, do_quote=False)
+
+    await _stop_runner(chat_id)
+    async with _runs_lock:
+        runner = ClaudeRunner(chat_id, _steer_manager)
+        runner.config["resume"] = target
+        _active_runs[chat_id] = runner
+        # Start with no goal — claude loads the existing session
+        await runner.start("(resumed session — continue from where you left off)", send_fn, update.message.chat)
+
+
+async def handle_fork(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/fork` — fork current session into a new one (keeps history, new id)."""
+    chat_id = update.message.chat_id
+    async with _runs_lock:
+        runner = _active_runs.get(chat_id)
+    if not runner:
+        await update.message.reply_text("no active session to fork", do_quote=True)
+        return
+    if not runner.claude_session_id:
+        await update.message.reply_text("session hasn't initialized yet — wait a moment", do_quote=True)
+        return
+
+    log_event("fork_session", chat_id, {"from": runner.claude_session_id})
+    await update.message.reply_text("🍴 forking session…", do_quote=True)
+
+    async def send_fn(text):
+        try:
+            await update.message.reply_text(text, do_quote=False, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await update.message.reply_text(text, do_quote=False)
+
+    # Capture old session id, then restart with --resume + --fork-session
+    old_id = runner.claude_session_id
+    await _stop_runner(chat_id)
+    async with _runs_lock:
+        runner = ClaudeRunner(chat_id, _steer_manager)
+        runner.config["resume"] = old_id
+        runner.config["fork_session"] = True
+        _active_runs[chat_id] = runner
+        await runner.start("(forked — independent branch)", send_fn, update.message.chat)
+
+
+async def handle_add_dir(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/add-dir <path>` — give claude access to a directory. Restarts session."""
+    chat_id = update.message.chat_id
+    raw = update.message.text.split(maxsplit=1)
+    if len(raw) < 2 or not raw[1].strip():
+        await update.message.reply_text("Usage: `/add-dir <absolute path>`", do_quote=True, parse_mode=ParseMode.MARKDOWN)
+        return
+    path = raw[1].strip()
+    if not os.path.isabs(path):
+        path = os.path.abspath(path)
+    if not os.path.isdir(path):
+        await update.message.reply_text(f"❌ not a directory: {path}", do_quote=True)
+        return
+
+    async with _runs_lock:
+        runner = _active_runs.get(chat_id)
+    if not runner:
+        await update.message.reply_text("no active session — send a message first to start one", do_quote=True)
+        return
+    if path in runner.config["add_dirs"]:
+        await update.message.reply_text(f"📁 already in add-dirs: {path}", do_quote=True)
+        return
+
+    new_dirs = runner.config["add_dirs"] + [path]
+    log_event("add_dir", chat_id, {"path": path, "all_dirs": new_dirs})
+
+    async def send_fn(text):
+        try:
+            await update.message.reply_text(text, do_quote=False, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await update.message.reply_text(text, do_quote=False)
+
+    await runner.restart_with_config({"add_dirs": new_dirs}, send_fn)
+
+
+async def handle_set_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/model <name>` — switch model. Restarts session."""
+    chat_id = update.message.chat_id
+    raw = update.message.text.split(maxsplit=1)
+    if len(raw) < 2 or not raw[1].strip():
+        await update.message.reply_text(
+            "Usage: `/model <model-name>`\n"
+            "Examples: `claude-sonnet-4-5-20250929`, `claude-opus-4-1`, `sonnet`, `opus`",
+            do_quote=True, parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    new_model = raw[1].strip()
+
+    async with _runs_lock:
+        runner = _active_runs.get(chat_id)
+    if not runner:
+        await update.message.reply_text("no active session — send a message first", do_quote=True)
+        return
+
+    log_event("set_model", chat_id, {"from": runner.config["model"], "to": new_model})
+
+    async def send_fn(text):
+        try:
+            await update.message.reply_text(text, do_quote=False, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await update.message.reply_text(text, do_quote=False)
+
+    await runner.restart_with_config({"model": new_model}, send_fn)
+
+
+async def handle_set_agent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/agent <name>` — use a specific subagent. Restarts session."""
+    chat_id = update.message.chat_id
+    raw = update.message.text.split(maxsplit=1)
+    if len(raw) < 2 or not raw[1].strip():
+        await update.message.reply_text(
+            "Usage: `/agent <agent-name>`\n"
+            "Example: `/agent Explore`, `/agent Plan`, `/agent general-purpose`\n"
+            "Pass `/agent default` to clear.",
+            do_quote=True, parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    name = raw[1].strip()
+    new_agent = None if name.lower() in ("default", "none", "clear") else name
+
+    async with _runs_lock:
+        runner = _active_runs.get(chat_id)
+    if not runner:
+        await update.message.reply_text("no active session — send a message first", do_quote=True)
+        return
+
+    log_event("set_agent", chat_id, {"agent": new_agent})
+
+    async def send_fn(text):
+        try:
+            await update.message.reply_text(text, do_quote=False, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await update.message.reply_text(text, do_quote=False)
+
+    await runner.restart_with_config({"agent": new_agent}, send_fn)
+
+
+async def handle_set_effort(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/effort <level>` — reasoning effort. Restarts session."""
+    chat_id = update.message.chat_id
+    raw = update.message.text.split(maxsplit=1)
+    if len(raw) < 2 or not raw[1].strip():
+        await update.message.reply_text(
+            "Usage: `/effort <low|medium|high|xhigh|max>`",
+            do_quote=True, parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    level = raw[1].strip().lower()
+    if level not in ("low", "medium", "high", "xhigh", "max"):
+        await update.message.reply_text(f"❌ invalid effort level: {level}", do_quote=True)
+        return
+
+    async with _runs_lock:
+        runner = _active_runs.get(chat_id)
+    if not runner:
+        await update.message.reply_text("no active session — send a message first", do_quote=True)
+        return
+
+    log_event("set_effort", chat_id, {"effort": level})
+
+    async def send_fn(text):
+        try:
+            await update.message.reply_text(text, do_quote=False, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await update.message.reply_text(text, do_quote=False)
+
+    await runner.restart_with_config({"effort": level}, send_fn)
+
+
+async def handle_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/sessions` — list recent claude sessions from ~/.claude/projects/."""
+    chat_id = update.message.chat_id
+    if not CLAUDE_PROJECTS_DIR.exists():
+        await update.message.reply_text("no claude session history found", do_quote=True)
+        return
+
+    # Find session JSONL files (each is a saved session)
+    sessions = []
+    for jsonl in CLAUDE_PROJECTS_DIR.rglob("*.jsonl"):
+        try:
+            stat = jsonl.stat()
+            if stat.st_size == 0:
+                continue
+            # First line of session JSONL has session metadata
+            with open(jsonl) as f:
+                first_line = f.readline()
+            if not first_line.strip():
+                continue
+            meta = json.loads(first_line)
+            if meta.get("type") != "user":
+                continue
+            sid = meta.get("sessionId", jsonl.stem)
+            msg = meta.get("message", {})
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                content = "\n".join(b.get("text","") for b in content if b.get("type") == "text")
+            preview = (content or "(empty)")[:80].replace("\n", " ")
+            sessions.append({
+                "id": sid,
+                "ts": stat.st_mtime,
+                "size": stat.st_size,
+                "preview": preview,
+            })
+        except Exception:
+            continue
+
+    if not sessions:
+        await update.message.reply_text("no parseable sessions found", do_quote=True)
+        return
+
+    # Sort newest first, limit to 15
+    sessions.sort(key=lambda s: s["ts"], reverse=True)
+    sessions = sessions[:15]
+
+    lines = [f"📂 *Recent sessions* ({len(sessions)}):\n"]
+    for s in sessions:
+        from datetime import datetime as _dt
+        age = _dt.fromtimestamp(s["ts"]).strftime("%Y-%m-%d %H:%M")
+        lines.append(f"`{s['id'][:8]}`  {age}  {s['preview']}")
+
+    lines.append("\nUse `/resume <id>` to continue one.")
+    await update.message.reply_text("\n".join(lines), do_quote=True, parse_mode=ParseMode.MARKDOWN)
+
+
+async def handle_pwd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/pwd` — show claude's working directory and config."""
+    chat_id = update.message.chat_id
+    async with _runs_lock:
+        runner = _active_runs.get(chat_id)
+    cwd = os.getcwd()
+    info = f"📍 *Bot cwd*: `{cwd}`\n"
+    if runner:
+        c = runner.config
+        info += (
+            f"\n*Session config*:"
+            f"\n• model: `{c['model']}`"
+            f"\n• agent: `{c.get('agent') or '(default)'}`"
+            f"\n• add-dirs: {c.get('add_dirs') or '[]'}"
+            f"\n• effort: `{c.get('effort') or '(default)'}`"
+            f"\n• session-id: `{runner.session_id[:8]}…`"
+            f"\n• resume: `{c.get('resume') or '(new)'}`"
+        )
+    await update.message.reply_text(info, do_quote=True, parse_mode=ParseMode.MARKDOWN)
+
+
+# ─────────────────────────────────────────────────────────────
+# Photo + voice handlers — feed into active session
+# ─────────────────────────────────────────────────────────────
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Download photo, base64 it, inject as a message with image content."""
+    chat_id = update.message.chat_id
+    if not update.message.photo:
+        return
+    await update.message.reply_text("📷 downloading…", do_quote=True)
+
+    try:
+        photo = update.message.photo[-1]  # largest size
+        file = await context.bot.get_file(photo.file_id)
+        buf = io.BytesIO()
+        await file.download_to_memory(buf)
+        img_bytes = buf.getvalue()
+        img_b64 = base64.b64encode(img_bytes).decode()
+
+        async with _runs_lock:
+            runner = _active_runs.get(chat_id)
+
+        if runner and runner._running:
+            # Inject as a multi-part message: text description + image
+            caption = update.message.caption or "(user sent an image, please analyze)"
+            content = [
+                {"type": "text", "text": caption},
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": img_b64,
+                    },
+                },
+            ]
+            runner._pending_inject.append(content)  # type: ignore[arg-type]
+            runner._inject_event.set()
+            log_event("user_image", chat_id, {"caption": caption, "size": len(img_bytes)})
+            await update.message.reply_text("↪️ image injected into session", do_quote=True)
+        else:
+            # No active session — start one with the image as initial context
+            caption = update.message.caption or "analyze this image"
+            content = [
+                {"type": "text", "text": caption},
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": img_b64,
+                    },
+                },
+            ]
+            # Use Anthropic-format content directly (claude supports it)
+            await update.message.reply_text("🤖 starting session with image…", do_quote=True)
+            # For first message, we need to send multi-part content via stream-json
+            # stream-json accepts {"type":"user","message":{"role":"user","content":[...]}}
+            async def send_fn(text):
+                try:
+                    await update.message.reply_text(text, do_quote=False, parse_mode=ParseMode.MARKDOWN)
+                except Exception:
+                    await update.message.reply_text(text, do_quote=False)
+            await _stop_runner(chat_id)
+            async with _runs_lock:
+                runner = ClaudeRunner(chat_id, _steer_manager)
+                _active_runs[chat_id] = runner
+                await runner.start_multimodal(content, send_fn, update.message.chat)
+            log_event("user_image_start", chat_id, {"caption": caption, "size": len(img_bytes)})
+    except Exception as e:
+        log_event("photo_error", chat_id, {"error": str(e)})
+        await update.message.reply_text(f"photo error: {e}", do_quote=True)
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Download voice, transcribe via Whisper, inject text into session."""
+    chat_id = update.message.chat_id
+    if not update.message.voice:
+        return
+    api_key = WHISPER_API_KEY or OPENAI_API_KEY
+    if not api_key:
+        await update.message.reply_text(
+            "voice transcription requires WHISPER_API_KEY or OPENAI_API_KEY in .env",
+            do_quote=True,
+        )
+        return
+    await update.message.reply_text("🎙 transcribing…", do_quote=True)
+    try:
+        voice = update.message.voice
+        file = await context.bot.get_file(voice.file_id)
+        buf = io.BytesIO()
+        await file.download_to_memory(buf)
+        ogg_bytes = buf.getvalue()
+
+        # Whisper API
+        resp = requests.post(
+            f"{OPENAI_BASE_URL}/audio/transcriptions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            files={"file": ("voice.ogg", ogg_bytes, "audio/ogg")},
+            data={"model": "whisper-1", "language": "en"},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        text = resp.json().get("text", "").strip()
+        if not text:
+            await update.message.reply_text("(no speech detected)", do_quote=True)
+            return
+
+        await update.message.reply_text(f"🎙 {text}", do_quote=True)
+        log_event("user_voice", chat_id, {"text": text, "duration": voice.duration})
+
+        async with _runs_lock:
+            runner = _active_runs.get(chat_id)
+        if runner and runner._running:
+            await runner.inject_prompt(text)
+            await update.message.reply_text("↪️ injected into session", do_quote=True)
+        else:
+            await update.message.reply_text("🤖 starting session with voice…", do_quote=True)
+            async def send_fn(t):
+                try:
+                    await update.message.reply_text(t, do_quote=False, parse_mode=ParseMode.MARKDOWN)
+                except Exception:
+                    await update.message.reply_text(t, do_quote=False)
+            await _stop_runner(chat_id)
+            async with _runs_lock:
+                runner = ClaudeRunner(chat_id, _steer_manager)
+                _active_runs[chat_id] = runner
+                await runner.start(text, send_fn, update.message.chat)
+    except Exception as e:
+        log_event("voice_error", chat_id, {"error": str(e)})
+        await update.message.reply_text(f"voice error: {e}", do_quote=True)
+
+
 async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 *Claude-bot v2 — persistent sessions*\n\n"
-        "• Send any message → starts a *persistent* Claude session for this chat\n"
-        "• Send another message while it's running → *injected as steering input*\n"
-        "• Every 10 responses, a checkpoint summary is posted + steering check\n"
-        "• If steering needed, you'll be asked a question — just reply\n\n"
-        "*Commands:*\n"
-        "`/status` — show session state + checkpoint info\n"
+        "🤖 *Claude-bot v3 — full Claude Code parity over Telegram*\n\n"
+        "*Conversation:*\n"
+        "• Send a message → starts a persistent Claude session for this chat\n"
+        "• Send another while running → injected as a *steering input*\n"
+        "• Send a photo → analyzed + injected into session (Anthropic vision)\n"
+        "• Send a voice note → Whisper transcribes + injects text\n"
+        "• Every 10 responses: auto-checkpoint + steering check\n\n"
+        "*Session control:*\n"
+        "`/new <goal>` — start a fresh session with the given goal\n"
+        "`/resume <id>` — resume a saved claude session (use `/sessions` to list)\n"
+        "`/fork` — fork current session into an independent branch\n"
         "`/cancel` — stop the running session\n"
+        "`/status` — session state, checkpoint, current config\n"
+        "`/pwd` — show bot cwd + session config\n\n"
+        "*Claude config (each restarts session):*\n"
+        "`/model <name>` — switch model (`sonnet`, `opus`, full name)\n"
+        "`/agent <name>` — use a subagent (`Explore`, `Plan`, `general-purpose`)\n"
+        "`/add-dir <path>` — give claude access to a directory\n"
+        "`/effort <low|medium|high|xhigh|max>` — reasoning effort\n\n"
+        "*Tools (one-shot, no session):*\n"
         "`/imagine <prompt>` — generate image (MiniMax)\n"
         "`/speak <text>` — text-to-speech (MiniMax)\n",
         do_quote=True,
@@ -794,14 +1410,27 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
+    # Order matters: more specific commands first
     app.add_handler(CommandHandler(["help", "start"], handle_help))
-    app.add_handler(CommandHandler(["status"], handle_status))
-    app.add_handler(CommandHandler(["cancel"], handle_cancel))
+    app.add_handler(CommandHandler(["status", "st"], handle_status))
+    app.add_handler(CommandHandler(["cancel", "stop"], handle_cancel))
+    app.add_handler(CommandHandler(["new"], handle_new))
+    app.add_handler(CommandHandler(["resume"], handle_resume))
+    app.add_handler(CommandHandler(["fork"], handle_fork))
+    app.add_handler(CommandHandler(["sessions", "history"], handle_sessions))
+    app.add_handler(CommandHandler(["adddir", "adddirs"], handle_add_dir))
+    app.add_handler(CommandHandler(["model", "m"], handle_set_model))
+    app.add_handler(CommandHandler(["agent", "a"], handle_set_agent))
+    app.add_handler(CommandHandler(["effort"], handle_set_effort))
+    app.add_handler(CommandHandler(["pwd", "where"], handle_pwd))
     app.add_handler(CommandHandler(["imagine", "image"], handle_image_gen))
     app.add_handler(CommandHandler(["speak", "tts"], handle_tts))
+    # Media + text
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    print(f"Bot v2 starting…", flush=True)
+    print(f"Bot v3 starting…", flush=True)
     print(f"  CLAUDE_MODEL      = {CLAUDE_MODEL}", flush=True)
     print(f"  CHECKPOINT_EVERY  = {CHECKPOINT_EVERY}", flush=True)
     print(f"  Training log dir  = {LOG_DIR}", flush=True)
