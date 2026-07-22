@@ -232,7 +232,7 @@ def upsert_session(chat_id: int, claude_session_id: str | None, goal: str | None
     else:
         conn.execute(
             "INSERT INTO sessions (chat_id, claude_session_id, goal) VALUES (?, ?, ?) "
-            "ON CONFLICT(chat_id) DO UPDATE SET claude_session_id = excluded.claude_session_id, goal = COALESCE(sessions.goal, excluded.goal), last_active = CURRENT_TIMESTAMP",
+            "ON CONFLICT(chat_id) DO UPDATE SET claude_session_id = excluded.claude_session_id, goal = excluded.goal, last_active = CURRENT_TIMESTAMP",
             (chat_id, claude_session_id, goal),
         )
     conn.commit()
@@ -316,6 +316,10 @@ class ClaudeRunner:
         self._send_to_user_fn = send_fn
         self._user_chat = user_chat
         self._running = True
+
+        # Reset steering state for the new session so the new goal wins over any old one
+        if self.steer_manager is not None:
+            await self.steer_manager.reset_for_new_session(self.chat_id, goal)
 
         # Build claude command from current config
         cmd = self._build_cmd()
@@ -634,6 +638,20 @@ class SteeringManager:
         if runner.response_count % CHECKPOINT_EVERY == 0:
             await self.checkpoint(runner)
 
+    async def reset_for_new_session(self, chat_id: int, new_goal: str) -> None:
+        """Wipe the per-session steering state when a fresh /new is launched.
+
+        Without this, the old session's goal, responses, and checkpoint survive
+        a /new — the steering manager would keep reasoning against stale context.
+        """
+        async with self.lock:
+            st = self._load_state(chat_id)
+            st["goal"] = new_goal
+            st["last_responses"] = []
+            st["checkpoint"] = None
+            st["steer_history"] = []
+            self._save_state(chat_id)
+
     async def checkpoint(self, runner: ClaudeRunner):
         """Call M3 to summarize state and decide if steering is needed."""
         async with self.lock:
@@ -760,6 +778,26 @@ def _format_checkpoint_summary(parsed: dict, n: int) -> str:
 # ─────────────────────────────────────────────────────────────
 _active_runs: dict[int, ClaudeRunner] = {}
 _runs_lock = asyncio.Lock()
+# chat_id -> True when a bare /new is awaiting the next text message as the goal
+_pending_new_goal: dict[int, bool] = {}
+_pending_lock = asyncio.Lock()
+
+
+async def _set_pending_goal(chat_id: int) -> None:
+    async with _pending_lock:
+        _pending_new_goal[chat_id] = True
+
+
+async def _consume_pending_goal(chat_id: int) -> bool:
+    """Return True (and clear) if this chat has a pending /new goal awaiting text."""
+    async with _pending_lock:
+        return _pending_new_goal.pop(chat_id, False)
+
+
+async def _clear_pending_goal(chat_id: int) -> None:
+    """Clear the pending-goal flag without consuming it (e.g. on /cancel)."""
+    async with _pending_lock:
+        _pending_new_goal.pop(chat_id, None)
 _steer_manager = SteeringManager()
 
 
@@ -786,14 +824,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     chat_id = update.message.chat_id
     user = update.message.from_user
-    log_msg(chat_id, "user", prompt, "text")
-    log_event("user_message", chat_id, {"text": prompt, "user_id": user.id if user else None})
 
     # If user just ran `/new` with no goal, this next text is the goal
-    if context.user_data.pop("awaiting_new_goal", False):
+    if await _consume_pending_goal(chat_id):
+        # Don't double-log the goal — runner.start() will log it as a [goal] message
         await update.message.reply_text(
-            f"🆕 starting new session with goal: _{prompt}_",
-            do_quote=True, parse_mode=ParseMode.MARKDOWN,
+            f"🆕 starting new session with goal: {prompt}",
+            do_quote=True,
         )
         log_event("new_session", chat_id, {"goal": prompt, "via": "interactive_prompt"})
 
@@ -812,6 +849,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _active_runs[chat_id] = runner
             await runner.start(prompt, send_fn, update.message.chat)
         return
+
+    log_msg(chat_id, "user", prompt, "text")
+    log_event("user_message", chat_id, {"text": prompt, "user_id": user.id if user else None})
 
     async with _runs_lock:
         runner = _active_runs.get(chat_id)
@@ -936,6 +976,7 @@ async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
+    await _clear_pending_goal(chat_id)
     async with _runs_lock:
         runner = _active_runs.get(chat_id)
     if runner:
@@ -999,24 +1040,26 @@ HELP_TEXT = (
 
 
 async def handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """`/new [goal]` — show menu + start a new session (goal optional)."""
+    """`/new [goal]` — always show the menu + start a session (goal optional)."""
     chat_id = update.message.chat_id
     raw = update.message.text.split(maxsplit=1)
     goal = raw[1].strip() if len(raw) > 1 else ""
+    await _clear_pending_goal(chat_id)  # any prior pending state is now superseded
     if not goal:
         # Show command menu + ask for goal interactively
         await update.message.reply_text(
-            HELP_TEXT + "\n\n💬 *Reply with your goal* for the new session\n"
+            HELP_TEXT + "\n\n💬 Reply with your goal for the new session\n"
             "_(or send `/new <goal>` in one message to skip this prompt)_",
             do_quote=True, parse_mode=ParseMode.MARKDOWN,
         )
-        # Set state so next text message becomes the new-session goal
-        context.user_data["awaiting_new_goal"] = True
+        await _set_pending_goal(chat_id)
         return
 
-    await update.message.reply_text("🆕 starting new session…", do_quote=True)
-    log_event("new_session", chat_id, {"goal": goal})
-    context.user_data.pop("awaiting_new_goal", None)
+    await update.message.reply_text(
+        f"🆕 starting new session with goal: {goal}",
+        do_quote=True,
+    )
+    log_event("new_session", chat_id, {"goal": goal, "via": "inline"})
 
     async def send_fn(text):
         try:
@@ -1024,7 +1067,6 @@ async def handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             await update.message.reply_text(text, do_quote=False)
 
-    # Stop old, start new
     await _stop_runner(chat_id)
     async with _runs_lock:
         runner = ClaudeRunner(chat_id, _steer_manager)
@@ -1539,6 +1581,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     if not update.message.photo:
         return
+    await _consume_pending_goal(chat_id)
     await update.message.reply_text("📷 downloading…", do_quote=True)
 
     try:
@@ -1611,11 +1654,13 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     api_key = WHISPER_API_KEY or OPENAI_API_KEY
     if not api_key:
+        await _consume_pending_goal(chat_id)
         await update.message.reply_text(
             "voice transcription requires WHISPER_API_KEY or OPENAI_API_KEY in .env",
             do_quote=True,
         )
         return
+    await _consume_pending_goal(chat_id)
     await update.message.reply_text("🎙 transcribing…", do_quote=True)
     try:
         voice = update.message.voice
@@ -1671,6 +1716,23 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Entrypoint
 # ─────────────────────────────────────────────────────────────
 
+async def _pre_command_clear_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Group -1 pre-handler: any slash command (except /new itself) clears a pending /new goal.
+
+    This prevents the next text message from being silently consumed as a goal
+    after the user runs e.g. /status or /ls in the middle of an interactive /new.
+    """
+    if not update.message or not update.message.text:
+        return
+    if not update.message.text.startswith("/"):
+        return
+    # Don't clear for /new — handle_new sets the flag itself
+    first_token = update.message.text.split(maxsplit=1)[0].split("@")[0].lower()
+    if first_token == "/new":
+        return
+    await _clear_pending_goal(update.message.chat_id)
+
+
 def main():
     if not BOT_TOKEN:
         print("ERROR: TELEGRAM_BOT_TOKEN not set", flush=True)
@@ -1681,6 +1743,11 @@ def main():
     init_db()
 
     app = Application.builder().token(BOT_TOKEN).build()
+
+    # Group -1: clear pending /new goal whenever user runs any other slash command.
+    # Without this, the next text message would silently become a new-session goal
+    # after the user runs e.g. /status mid-prompt.
+    app.add_handler(MessageHandler(filters.COMMAND, _pre_command_clear_pending), group=-1)
 
     # Order matters: more specific commands first
     app.add_handler(CommandHandler(["help", "start"], handle_help))
