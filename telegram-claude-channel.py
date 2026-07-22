@@ -296,9 +296,10 @@ class ClaudeRunner:
         self._send_to_user_fn: Optional[Callable] = None
         self._user_chat: Any | None = None  # telegram Chat object for steering question
         self._running = False
-        # Configurable flags (set via /agent, /add-dir, /model, /effort)
+        # Configurable flags (set via /agent, /add-dir, /model, /effort, /cd)
         self.config: dict = {
             "model": CLAUDE_MODEL,
+            "cwd": os.getcwd(),    # claude's working directory (set by /cd)
             "add_dirs": [],        # list of paths → --add-dir
             "agent": None,         # → --agent
             "agents": None,        # → --agents (json string)
@@ -333,6 +334,7 @@ class ClaudeRunner:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env={**os.environ, "NO_COLOR": "1", "CLAUDE_CODE_SIMPLE": "1"},
+                cwd=self.config.get("cwd") or os.getcwd(),
             )
         except FileNotFoundError as e:
             log_event("runner_start_failed", self.chat_id, {"error": str(e)})
@@ -440,6 +442,7 @@ class ClaudeRunner:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env={**os.environ, "NO_COLOR": "1", "CLAUDE_CODE_SIMPLE": "1"},
+                cwd=self.config.get("cwd") or os.getcwd(),
             )
         except FileNotFoundError as e:
             log_event("runner_start_failed", self.chat_id, {"error": str(e)})
@@ -881,6 +884,7 @@ async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         dirs = ", ".join(c.get("add_dirs", [])) or "(none)"
         config_summary = (
             f"\n\n⚙️ *Config*:"
+            f"\n  cwd: `{c.get('cwd') or os.getcwd()}`"
             f"\n  model: `{c.get('model', CLAUDE_MODEL)}`"
             f"\n  agent: `{c.get('agent') or '(default)'}`"
             f"\n  add-dirs: {dirs}"
@@ -1026,41 +1030,6 @@ async def handle_fork(update: Update, context: ContextTypes.DEFAULT_TYPE):
         runner.config["fork_session"] = True
         _active_runs[chat_id] = runner
         await runner.start("(forked — independent branch)", send_fn, update.message.chat)
-
-
-async def handle_add_dir(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """`/add-dir <path>` — give claude access to a directory. Restarts session."""
-    chat_id = update.message.chat_id
-    raw = update.message.text.split(maxsplit=1)
-    if len(raw) < 2 or not raw[1].strip():
-        await update.message.reply_text("Usage: `/add-dir <absolute path>`", do_quote=True, parse_mode=ParseMode.MARKDOWN)
-        return
-    path = raw[1].strip()
-    if not os.path.isabs(path):
-        path = os.path.abspath(path)
-    if not os.path.isdir(path):
-        await update.message.reply_text(f"❌ not a directory: {path}", do_quote=True)
-        return
-
-    async with _runs_lock:
-        runner = _active_runs.get(chat_id)
-    if not runner:
-        await update.message.reply_text("no active session — send a message first to start one", do_quote=True)
-        return
-    if path in runner.config["add_dirs"]:
-        await update.message.reply_text(f"📁 already in add-dirs: {path}", do_quote=True)
-        return
-
-    new_dirs = runner.config["add_dirs"] + [path]
-    log_event("add_dir", chat_id, {"path": path, "all_dirs": new_dirs})
-
-    async def send_fn(text):
-        try:
-            await update.message.reply_text(text, do_quote=False, parse_mode=ParseMode.MARKDOWN)
-        except Exception:
-            await update.message.reply_text(text, do_quote=False)
-
-    await runner.restart_with_config({"add_dirs": new_dirs}, send_fn)
 
 
 async def handle_set_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1213,16 +1182,18 @@ async def handle_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_pwd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """`/pwd` — show claude's working directory and config."""
+    """`/pwd` — show bot cwd + claude's session cwd + config."""
     chat_id = update.message.chat_id
     async with _runs_lock:
         runner = _active_runs.get(chat_id)
-    cwd = os.getcwd()
-    info = f"📍 *Bot cwd*: `{cwd}`\n"
+    bot_cwd = os.getcwd()
+    info = f"📍 *Bot cwd*: `{bot_cwd}`\n"
     if runner:
         c = runner.config
+        session_cwd = c.get("cwd") or bot_cwd
         info += (
-            f"\n*Session config*:"
+            f"\n📂 *Claude cwd*: `{session_cwd}`"
+            f"\n\n*Session config*:"
             f"\n• model: `{c['model']}`"
             f"\n• agent: `{c.get('agent') or '(default)'}`"
             f"\n• add-dirs: {c.get('add_dirs') or '[]'}"
@@ -1231,6 +1202,269 @@ async def handle_pwd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"\n• resume: `{c.get('resume') or '(new)'}`"
         )
     await update.message.reply_text(info, do_quote=True, parse_mode=ParseMode.MARKDOWN)
+
+
+async def handle_cd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/cd <path>` — change claude's working directory. Restarts session.
+    Accepts absolute paths, ~ paths, and .. relative traversal.
+    If no path given, goes to bot's cwd.
+    """
+    chat_id = update.message.chat_id
+    raw = update.message.text.split(maxsplit=1)
+    target = raw[1].strip() if len(raw) > 1 else ""
+
+    async with _runs_lock:
+        runner = _active_runs.get(chat_id)
+    if not runner:
+        await update.message.reply_text(
+            "no active session — send a message first to start one",
+            do_quote=True,
+        )
+        return
+
+    if not target:
+        # /cd with no arg → bot cwd
+        target = os.getcwd()
+    else:
+        # Resolve ~ and relative paths against current session cwd
+        target = os.path.expanduser(target)
+        if not os.path.isabs(target):
+            target = os.path.join(runner.config.get("cwd") or os.getcwd(), target)
+        target = os.path.abspath(target)
+
+    if not os.path.isdir(target):
+        await update.message.reply_text(f"❌ not a directory: `{target}`", do_quote=True, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    if target == runner.config.get("cwd"):
+        await update.message.reply_text(f"📂 already there: `{target}`", do_quote=True, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    log_event("cd", chat_id, {"from": runner.config.get("cwd"), "to": target})
+
+    async def send_fn(text):
+        try:
+            await update.message.reply_text(text, do_quote=False, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await update.message.reply_text(text, do_quote=False)
+
+    await runner.restart_with_config({"cwd": target}, send_fn)
+
+
+async def handle_ls(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/ls [path]` — list directory contents. Defaults to claude's cwd."""
+    chat_id = update.message.chat_id
+    raw = update.message.text.split(maxsplit=1)
+    arg = raw[1].strip() if len(raw) > 1 else ""
+
+    async with _runs_lock:
+        runner = _active_runs.get(chat_id)
+    base = (runner.config.get("cwd") if runner else None) or os.getcwd()
+
+    if arg:
+        target = os.path.expanduser(arg)
+        if not os.path.isabs(target):
+            target = os.path.join(base, target)
+        target = os.path.abspath(target)
+    else:
+        target = base
+
+    if not os.path.isdir(target):
+        await update.message.reply_text(f"❌ not a directory: `{target}`", do_quote=True, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    try:
+        entries = sorted(os.listdir(target))
+    except PermissionError:
+        await update.message.reply_text(f"❌ permission denied: `{target}`", do_quote=True, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # Mark dirs vs files, show sizes for files
+    lines = [f"📁 `{target}`\n"]
+    dirs = []
+    files = []
+    for name in entries:
+        if name.startswith("."):
+            continue  # skip hidden by default (user can ls -a separately if they want)
+        full = os.path.join(target, name)
+        try:
+            if os.path.isdir(full):
+                dirs.append(f"📂 {name}/")
+            else:
+                size = os.path.getsize(full)
+                files.append(f"📄 {name}  ({_format_size(size)})")
+        except OSError:
+            continue
+
+    # Cap at 60 entries to keep telegram message short
+    shown_dirs = dirs[:30]
+    shown_files = files[:30]
+    lines.extend(shown_dirs)
+    if shown_dirs and shown_files:
+        lines.append("")
+    lines.extend(shown_files)
+
+    if len(dirs) > 30 or len(files) > 30:
+        lines.append(f"\n_…showing 30 of {len(dirs) + len(files)} entries_")
+    if not dirs and not files:
+        lines.append("_(empty)_")
+
+    await update.message.reply_text("\n".join(lines), do_quote=True, parse_mode=ParseMode.MARKDOWN)
+
+
+async def handle_tree(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/tree [depth] [path]` — show directory tree. Default depth=2, path=cwd."""
+    chat_id = update.message.chat_id
+    parts = update.message.text.split()
+    # /tree [depth] [path]
+    depth = 2
+    arg = ""
+    if len(parts) > 1:
+        try:
+            depth = int(parts[1])
+            depth = min(max(depth, 1), 5)  # cap at 5
+        except ValueError:
+            arg = parts[1]
+    if len(parts) > 2:
+        arg = parts[2]
+
+    async with _runs_lock:
+        runner = _active_runs.get(chat_id)
+    base = (runner.config.get("cwd") if runner else None) or os.getcwd()
+
+    target = arg or base
+    target = os.path.expanduser(target)
+    if not os.path.isabs(target):
+        target = os.path.join(base, target)
+    target = os.path.abspath(target)
+
+    if not os.path.isdir(target):
+        await update.message.reply_text(f"❌ not a directory: `{target}`", do_quote=True, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    lines = [f"🌳 `{target}` (depth {depth})\n"]
+    _tree_walk(target, "", depth, lines, count=[0])
+    if lines[-1].startswith("…"):
+        pass
+    else:
+        total = lines[-1] if "entries" in lines[-1] else None
+    if len(lines) > 1 and "entries" not in (lines[-1] or ""):
+        lines.append(f"\n_({len(lines)-1} entries)_")
+
+    # Cap output
+    output = "\n".join(lines)
+    if len(output) > 3500:
+        output = output[:3500] + "\n\n_…truncated_"
+    await update.message.reply_text(output, do_quote=True, parse_mode=ParseMode.MARKDOWN)
+
+
+def _tree_walk(path: str, prefix: str, depth: int, lines: list, count: list, max_entries=80):
+    if depth == 0:
+        return
+    if count[0] > max_entries:
+        lines.append(f"{prefix}…(truncated)")
+        return
+    try:
+        entries = sorted(
+            [e for e in os.listdir(path) if not e.startswith(".")],
+            key=lambda x: (not os.path.isdir(os.path.join(path, x)), x.lower()),
+        )
+    except PermissionError:
+        lines.append(f"{prefix}❌ permission denied")
+        return
+    for i, name in enumerate(entries):
+        if count[0] > max_entries:
+            lines.append(f"{prefix}…(truncated)")
+            return
+        full = os.path.join(path, name)
+        is_last = i == len(entries) - 1
+        connector = "└── " if is_last else "├── "
+        is_dir = os.path.isdir(full)
+        display = f"{name}/" if is_dir else name
+        lines.append(f"{prefix}{connector}{display}")
+        count[0] += 1
+        if is_dir and depth > 1:
+            extension = "    " if is_last else "│   "
+            _tree_walk(full, prefix + extension, depth - 1, lines, count, max_entries)
+
+
+def _format_size(n: int) -> str:
+    """Human-readable file size."""
+    for unit in ("B", "K", "M", "G", "T"):
+        if n < 1024:
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}P"
+
+
+async def handle_here(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/here` — shortcut for `/adddir .` — adds the session cwd to --add-dir.
+    Useful after `/cd` to give claude write access to the directory."""
+    chat_id = update.message.chat_id
+    async with _runs_lock:
+        runner = _active_runs.get(chat_id)
+    if not runner:
+        await update.message.reply_text("no active session", do_quote=True)
+        return
+    cwd = runner.config.get("cwd") or os.getcwd()
+    if cwd in runner.config["add_dirs"]:
+        await update.message.reply_text(f"📁 cwd already in add-dirs: `{cwd}`", do_quote=True, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    new_dirs = runner.config["add_dirs"] + [cwd]
+    log_event("here", chat_id, {"path": cwd, "all_dirs": new_dirs})
+
+    async def send_fn(text):
+        try:
+            await update.message.reply_text(text, do_quote=False, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await update.message.reply_text(text, do_quote=False)
+
+    await runner.restart_with_config({"add_dirs": new_dirs}, send_fn)
+
+
+async def handle_adddir(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/adddir <path>` — give claude access to a directory. Restarts session.
+    Aliases: /adddir, /adddirs, /cd <path> (when no session)"""
+    chat_id = update.message.chat_id
+    raw = update.message.text.split(maxsplit=1)
+    if len(raw) < 2 or not raw[1].strip():
+        await update.message.reply_text(
+            "Usage: `/adddir <absolute path>`\n"
+            "_Tip: use `/here` to add the current session cwd._",
+            do_quote=True, parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    path = raw[1].strip()
+    if not os.path.isabs(path):
+        # Resolve relative to session cwd if available, else bot cwd
+        async with _runs_lock:
+            runner = _active_runs.get(chat_id)
+        base = (runner.config.get("cwd") if runner else None) or os.getcwd()
+        path = os.path.abspath(os.path.join(base, path))
+    if not os.path.isdir(path):
+        await update.message.reply_text(f"❌ not a directory: `{path}`", do_quote=True, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    async with _runs_lock:
+        runner = _active_runs.get(chat_id)
+    if not runner:
+        await update.message.reply_text("no active session — send a message first to start one", do_quote=True)
+        return
+    if path in runner.config["add_dirs"]:
+        await update.message.reply_text(f"📁 already in add-dirs: `{path}`", do_quote=True, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    new_dirs = runner.config["add_dirs"] + [path]
+    log_event("add_dir", chat_id, {"path": path, "all_dirs": new_dirs})
+
+    async def send_fn(text):
+        try:
+            await update.message.reply_text(text, do_quote=False, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await update.message.reply_text(text, do_quote=False)
+
+    await runner.restart_with_config({"add_dirs": new_dirs}, send_fn)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1381,11 +1615,16 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/fork` — fork current session into an independent branch\n"
         "`/cancel` — stop the running session\n"
         "`/status` — session state, checkpoint, current config\n"
-        "`/pwd` — show bot cwd + session config\n\n"
+        "`/pwd` — show bot cwd + claude cwd + config\n\n"
+        "*Directory navigation:*\n"
+        "`/cd <path>` — change claude's working directory (restarts session)\n"
+        "`/ls [path]` — list directory contents (defaults to claude cwd)\n"
+        "`/tree [depth] [path]` — show directory tree (default depth 2)\n"
+        "`/here` — add current cwd to `--add-dir` (gives claude write access)\n"
+        "`/adddir <path>` — give claude access to an extra directory\n\n"
         "*Claude config (each restarts session):*\n"
         "`/model <name>` — switch model (`sonnet`, `opus`, full name)\n"
         "`/agent <name>` — use a subagent (`Explore`, `Plan`, `general-purpose`)\n"
-        "`/add-dir <path>` — give claude access to a directory\n"
         "`/effort <low|medium|high|xhigh|max>` — reasoning effort\n\n"
         "*Tools (one-shot, no session):*\n"
         "`/imagine <prompt>` — generate image (MiniMax)\n"
@@ -1418,7 +1657,11 @@ def main():
     app.add_handler(CommandHandler(["resume"], handle_resume))
     app.add_handler(CommandHandler(["fork"], handle_fork))
     app.add_handler(CommandHandler(["sessions", "history"], handle_sessions))
-    app.add_handler(CommandHandler(["adddir", "adddirs"], handle_add_dir))
+    app.add_handler(CommandHandler(["cd"], handle_cd))
+    app.add_handler(CommandHandler(["ls", "ll"], handle_ls))
+    app.add_handler(CommandHandler(["tree"], handle_tree))
+    app.add_handler(CommandHandler(["here"], handle_here))
+    app.add_handler(CommandHandler(["adddir", "adddirs"], handle_adddir))
     app.add_handler(CommandHandler(["model", "m"], handle_set_model))
     app.add_handler(CommandHandler(["agent", "a"], handle_set_agent))
     app.add_handler(CommandHandler(["effort"], handle_set_effort))
