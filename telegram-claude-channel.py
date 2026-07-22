@@ -473,9 +473,9 @@ async def send_long(
     for i in range(0, len(text), MAX_MSG_LEN):
         chunk = text[i : i + MAX_MSG_LEN]
         try:
-            await update.message.reply_text(chunk, quote=quote, parse_mode=parse_mode)
+            await update.message.reply_text(chunk, do_quote=quote, parse_mode=parse_mode)
         except Exception:
-            await update.message.reply_text(chunk, quote=quote, parse_mode=None)
+            await update.message.reply_text(chunk, do_quote=quote, parse_mode=None)
 
 
 async def claude_runner_handler(
@@ -488,7 +488,7 @@ async def claude_runner_handler(
     chat_id = update.message.chat_id
 
     log_msg(chat_id, "user", goal, media)
-    await update.message.reply_text("🤖 Starting Claude...", quote=True)
+    await update.message.reply_text("🤖 Starting Claude...", do_quote=True)
 
     runner = ClaudeRunner(chat_id, goal)
 
@@ -497,7 +497,7 @@ async def claude_runner_handler(
 
     try:
         await runner.run(args, lambda msg: update.message.reply_text(
-            msg, quote=False, parse_mode=ParseMode.MARKDOWN
+            msg, do_quote=False, parse_mode=ParseMode.MARKDOWN
         ))
     finally:
         async with _run_lock:
@@ -528,35 +528,35 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Note: MiniMax M3 supports image+video natively but not audio input yet,
     so we transcribe with Whisper first then feed text to Claude.
     Set WHISPER_API_KEY or OPENAI_API_KEY to enable."""
-    await update.message.reply_text("🎙 Transcribing...", quote=True)
+    await update.message.reply_text("🎙 Transcribing...", do_quote=True)
 
     try:
         voice_file = await context.bot.get_file(update.message.voice.file_id)
         ogg_bytes  = await voice_file.download_as_bytearray()
         text = transcribe_audio(bytes(ogg_bytes))
     except ValueError as e:
-        await update.message.reply_text(str(e), quote=True)
+        await update.message.reply_text(str(e), do_quote=True)
         return
     except Exception as e:
-        await update.message.reply_text(f"Transcription error: {e}", quote=True)
+        await update.message.reply_text(f"Transcription error: {e}", do_quote=True)
         return
 
     if not text.strip():
-        await update.message.reply_text("(no speech detected)", quote=True)
+        await update.message.reply_text("(no speech detected)", do_quote=True)
         return
 
     log_msg(update.message.chat_id, "user", f"[voice]: {text}", "audio")
-    await update.message.reply_text(f"🎙: {text}", quote=True)
+    await update.message.reply_text(f"🎙: {text}", do_quote=True)
     await claude_runner_handler(update, text, [text], media="audio")
 
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Video → MiniMax multimodal understanding → Claude."""
     if not MINIMAX_API_KEY:
-        await update.message.reply_text("MINIMAX_API_KEY not set", quote=True)
+        await update.message.reply_text("MINIMAX_API_KEY not set", do_quote=True)
         return
 
-    await update.message.reply_text("🎬 Analyzing video...", quote=True)
+    await update.message.reply_text("🎬 Analyzing video...", do_quote=True)
 
     try:
         video_file = await context.bot.get_file(update.message.video.file_id)
@@ -578,7 +578,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }], max_tokens=4000)
 
         log_msg(update.message.chat_id, "user", f"[video]: {description}", "video")
-        await update.message.reply_text(f"🎬: {description}", quote=True)
+        await update.message.reply_text(f"🎬: {description}", do_quote=True)
         await claude_runner_handler(
             update,
             f"Analyze this video: {description}",
@@ -587,16 +587,16 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     except Exception as e:
-        await update.message.reply_text(f"Video analysis error: {e}", quote=True)
+        await update.message.reply_text(f"Video analysis error: {e}", do_quote=True)
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Photo → MiniMax vision (base64) → Claude."""
     if not MINIMAX_API_KEY:
-        await update.message.reply_text("MINIMAX_API_KEY not set", quote=True)
+        await update.message.reply_text("MINIMAX_API_KEY not set", do_quote=True)
         return
 
-    await update.message.reply_text("🖼 Analyzing image...", quote=True)
+    await update.message.reply_text("🖼 Analyzing image...", do_quote=True)
 
     try:
         photo_file = await context.bot.get_file(update.message.photo[-1].file_id)
@@ -619,7 +619,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }], max_tokens=4000)
 
         log_msg(update.message.chat_id, "user", f"[image]: {description}", "image")
-        await update.message.reply_text(f"🖼: {description}", quote=True)
+        await update.message.reply_text(f"🖼: {description}", do_quote=True)
         await claude_runner_handler(
             update,
             f"Analyze this image: {description}",
@@ -628,48 +628,48 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     except Exception as e:
-        await update.message.reply_text(f"Image analysis error: {e}", quote=True)
+        await update.message.reply_text(f"Image analysis error: {e}", do_quote=True)
 
 
 async def handle_image_gen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/imagine <prompt> — generate image via MiniMax and send back."""
     prompt = update.message.text.replace("/imagine", "").replace("/image", "").strip()
     if not prompt:
-        await update.message.reply_text("Usage: `/imagine <prompt>`", quote=True)
+        await update.message.reply_text("Usage: `/imagine <prompt>`", do_quote=True)
         return
 
-    await update.message.reply_text("🎨 Generating...", quote=True)
+    await update.message.reply_text("🎨 Generating...", do_quote=True)
 
     try:
         img_bytes = mx_image(prompt)
         bio = io.BytesIO(img_bytes)
         bio.name = "generated.png"
-        await update.message.reply_photo(photo=bio, quote=True)
+        await update.message.reply_photo(photo=bio, do_quote=True)
         log_msg(update.message.chat_id, "bot", f"[image generated: {prompt}]", "image")
     except Exception as e:
-        await update.message.reply_text(f"Image gen error: {e}", quote=True)
+        await update.message.reply_text(f"Image gen error: {e}", do_quote=True)
 
 
 async def handle_tts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/speak <text> — convert text to speech via MiniMax TTS."""
     if not TTS_ENABLED or not MINIMAX_API_KEY:
-        await update.message.reply_text("TTS not configured", quote=True)
+        await update.message.reply_text("TTS not configured", do_quote=True)
         return
 
     text = update.message.text.replace("/speak", "").replace("/tts", "").strip()
     if not text:
-        await update.message.reply_text("Usage: `/speak <text>`", quote=True)
+        await update.message.reply_text("Usage: `/speak <text>`", do_quote=True)
         return
 
-    await update.message.reply_text("🔊 Generating audio...", quote=True)
+    await update.message.reply_text("🔊 Generating audio...", do_quote=True)
 
     try:
         mp3_bytes = mx_tts(text)
         bio = io.BytesIO(mp3_bytes)
         bio.name = "speech.mp3"
-        await update.message.reply_audio(audio=bio, quote=True)
+        await update.message.reply_audio(audio=bio, do_quote=True)
     except Exception as e:
-        await update.message.reply_text(f"TTS error: {e}", quote=True)
+        await update.message.reply_text(f"TTS error: {e}", do_quote=True)
 
 
 async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -683,7 +683,7 @@ async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
 
     if not rows:
-        await update.message.reply_text("No history yet.", quote=True)
+        await update.message.reply_text("No history yet.", do_quote=True)
         return
 
     lines = ["📋 *Recent messages:*\n"]
@@ -701,12 +701,12 @@ async def handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if runner:
         await update.message.reply_text(
             "⚠️ Cancellation requested — Claude will try to stop.",
-            quote=True,
+            do_quote=True,
         )
         # asyncio subprocess can't be killed cleanly, but we signal
         runner._cancel.set()
     else:
-        await update.message.reply_text("No active Claude process.", quote=True)
+        await update.message.reply_text("No active Claude process.", do_quote=True)
 
 
 async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -727,7 +727,7 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/imagine <prompt>` — generate image\n"
         "`/speak <text>` — text-to-speech\n"
     )
-    await update.message.reply_text(text, quote=True, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(text, do_quote=True, parse_mode=ParseMode.MARKDOWN)
 
 
 # ─────────────────────────────────────────────────────────────
