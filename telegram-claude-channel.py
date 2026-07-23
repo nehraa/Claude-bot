@@ -424,6 +424,7 @@ class ClaudeRunner:
         self.steer_manager = steer_manager
         self.session_id = str(uuid.uuid4())  # our session id (separate from claude's)
         self.claude_session_id: str | None = None  # claude's internal id (for --resume)
+        self.claude_cwd: str | None = None  # cwd claude was running in when it emitted init (for /resume lookup)
         self.process: asyncio.subprocess.Process | None = None
         self.goal: str = ""
         self.response_count = 0
@@ -838,6 +839,23 @@ class ClaudeRunner:
 
         if et == "system" and ev.get("subtype") == "init":
             self.claude_session_id = ev.get("session_id") or self.session_id
+            # Capture the cwd claude is running in. Critical for /resume —
+            # claude looks up sessions by (project, session_id) where project
+            # is derived from cwd. If we don't have the original cwd at
+            # resume time, claude returns "No conversation found" because
+            # it's looking in the wrong project directory.
+            self.claude_cwd = ev.get("cwd") or self.config.get("cwd")
+            # Persist (claude_session_id → cwd) mapping so /resume can find
+            # the original cwd even after the bot restarts. Without this,
+            # a session that was started with cwd=/home/Hermes/Claude-bot
+            # can't be resumed from a session with cwd=/home/Hermes because
+            # claude looks in the wrong project directory.
+            if self.claude_session_id and self.claude_cwd:
+                _register_session_cwd(self.claude_session_id, self.claude_cwd)
+            log_event("runner_init", self.chat_id, {
+                "claude_session_id": self.claude_session_id,
+                "claude_cwd": self.claude_cwd,
+            })
             return
 
         if et == "assistant":
@@ -1003,6 +1021,89 @@ class ClaudeRunner:
                 except Exception:
                     pass
         log_event("runner_stop", self.chat_id, {"session_id": self.session_id})
+
+
+# ─────────────────────────────────────────────────────────────
+# Session cwd registry — maps claude_session_id → original cwd
+# Needed for /resume: claude looks up sessions by (project, id)
+# where project is derived from cwd. If we don't remember the
+# original cwd, claude returns "No conversation found" because
+# it's looking in the wrong project directory.
+# ─────────────────────────────────────────────────────────────
+
+_SESSION_CWD_FILE = SESSION_DIR / "_session_cwds.json"
+_session_cwd_cache: dict[str, str] = {}
+
+
+def _load_session_cwds() -> dict[str, str]:
+    """Load the (claude_session_id → cwd) registry from disk."""
+    global _session_cwd_cache
+    if _session_cwd_cache:
+        return _session_cwd_cache
+    if _SESSION_CWD_FILE.exists():
+        try:
+            _session_cwd_cache = json.loads(_SESSION_CWD_FILE.read_text())
+        except Exception:
+            _session_cwd_cache = {}
+    return _session_cwd_cache
+
+
+def _save_session_cwds() -> None:
+    """Persist the cwd registry to disk."""
+    try:
+        _SESSION_CWD_FILE.write_text(json.dumps(_session_cwd_cache, indent=2))
+    except Exception as e:
+        log_event("session_cwd_save_error", 0, {"error": str(e)})
+
+
+def _register_session_cwd(claude_session_id: str, cwd: str) -> None:
+    """Record the original cwd for a claude session id."""
+    if not claude_session_id or not cwd:
+        return
+    cwds = _load_session_cwds()
+    cwds[claude_session_id] = cwd
+    # Cap at 1000 entries (old ones get GC'd by FIFO)
+    if len(cwds) > 1000:
+        # Keep last 1000 by insertion order
+        keys = list(cwds.keys())
+        for old in keys[:-1000]:
+            del cwds[old]
+    _save_session_cwds()
+
+
+def _lookup_session_cwd(claude_session_id: str) -> str | None:
+    """Look up the original cwd for a claude session id. None if unknown."""
+    return _load_session_cwds().get(claude_session_id)
+
+
+def _backfill_session_cwds() -> int:
+    """Scan ~/.claude/projects/ and populate the registry for any session
+    not already known. The directory name encodes the cwd (e.g. "-home-Hermes"
+    for /home/Hermes), so we can recover it without needing the original
+    claude_session_id→cwd mapping. Returns the number of new entries added.
+    """
+    cwds = _load_session_cwds()
+    projects_dir = Path.home() / ".claude" / "projects"
+    if not projects_dir.exists():
+        return 0
+    added = 0
+    for jsonl in projects_dir.rglob("*.jsonl"):
+        # Skip subagent JSONLs (share parent sessionId)
+        if "/subagents/" in str(jsonl):
+            continue
+        sid = jsonl.stem
+        if sid in cwds:
+            continue
+        # Decode the cwd from the parent directory name.
+        # Claude Code encodes: replace "/" with "-", prepend "-" for the
+        # leading slash. So "/home/Hermes" → "-home-Hermes".
+        encoded = jsonl.parent.name
+        original_cwd = "/" + encoded.lstrip("-").replace("-", "/")
+        cwds[sid] = original_cwd
+        added += 1
+    if added:
+        _save_session_cwds()
+    return added
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1698,20 +1799,67 @@ async def handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """`/resume <session_id>` — resume a saved claude session."""
+    """`/resume <session_id>` — resume a saved claude session.
+
+    BUG FIX v3.8.8: claude looks up sessions by (project, session_id) where
+    project is derived from the current cwd. If we don't have the original
+    cwd, claude returns "No conversation found" because it's searching the
+    wrong project directory. We now look up the original cwd in the
+    session cwd registry and override the runner's config["cwd"] before
+    spawning the subprocess.
+    """
     chat_id = update.message.chat_id
     raw = update.message.text.split(maxsplit=1)
     if len(raw) < 2 or not raw[1].strip():
         await update.message.reply_text(
             "Usage: `/resume <claude-session-id>`\n"
-            "Use `/sessions` to list available sessions.",
+            "Use `/sessions` to list available sessions. "
+            "You can paste a full UUID or the 8-char prefix shown in the list.",
             do_quote=True, parse_mode=ParseMode.MARKDOWN,
         )
         return
     target = raw[1].strip()
+    # Allow short prefix matching (e.g. "cda19a86" matches "cda19a86-...")
+    if len(target) < 36 and "-" not in target:
+        cwds = _load_session_cwds()
+        matches = [k for k in cwds.keys() if k.startswith(target)]
+        if len(matches) == 1:
+            target = matches[0]
+        elif len(matches) > 1:
+            await update.message.reply_text(
+                f"⚠️ `{target}` matches {len(matches)} sessions — paste more chars:\n"
+                + "\n".join(f"  `{m}`" for m in matches[:5]),
+                do_quote=True, parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+        # No match in registry — try the literal anyway, claude will error
+        # with a clear message.
 
-    await update.message.reply_text(f"↩️ resuming session `{target[:8]}…`", do_quote=True)
-    log_event("resume_session", chat_id, {"target": target})
+    # Look up the original cwd for this session
+    original_cwd = _lookup_session_cwd(target)
+    if not original_cwd:
+        # No record. Try to infer from the JSONL file location
+        # (~/.claude/projects/<encoded-cwd>/<session_id>.jsonl)
+        for jsonl in Path.home().joinpath(".claude/projects").rglob(f"{target}.jsonl"):
+            if "/subagents/" in str(jsonl):
+                continue
+            # The directory is the encoded cwd
+            encoded = jsonl.parent.name
+            # Decode: replace leading "-" separators with "/" — actually
+            # it's the path with "/" replaced by "-". E.g. "/home/Hermes"
+            # → "-home-Hermes". The leading character is always "-".
+            original_cwd = "/" + encoded.lstrip("-").replace("-", "/")
+            _register_session_cwd(target, original_cwd)
+            break
+
+    cwd_msg = f" (cwd: `{original_cwd}`)" if original_cwd else ""
+    await update.message.reply_text(
+        f"↩️ resuming session `{target[:8]}…`{cwd_msg}",
+        do_quote=True, parse_mode=ParseMode.MARKDOWN,
+    )
+    log_event("resume_session", chat_id, {
+        "target": target, "resolved_cwd": original_cwd,
+    })
 
     async def send_fn(text):
         try:
@@ -1723,6 +1871,12 @@ async def handle_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with _runs_lock:
         runner = ClaudeRunner(chat_id, _steer_manager)
         runner.config["resume"] = target
+        # CRITICAL: claude looks up the session by (project, id) where
+        # project is derived from cwd. We must spawn the subprocess in the
+        # session's ORIGINAL cwd, otherwise claude returns "No conversation
+        # found".
+        if original_cwd:
+            runner.config["cwd"] = original_cwd
         _active_runs[chat_id] = runner
         # Start with no goal — claude loads the existing session
         await runner.start("(resumed session — continue from where you left off)", send_fn, update.message.chat)
@@ -1751,11 +1905,17 @@ async def handle_fork(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Capture old session id, then restart with --resume + --fork-session
     old_id = runner.claude_session_id
+    # Preserve the original cwd so claude finds the session on resume.
+    # Without this, fork would re-cd to the bot's cwd and fail to find
+    # the parent session.
+    old_cwd = runner.claude_cwd or runner.config.get("cwd")
     await _stop_runner(chat_id)
     async with _runs_lock:
         runner = ClaudeRunner(chat_id, _steer_manager)
         runner.config["resume"] = old_id
         runner.config["fork_session"] = True
+        if old_cwd:
+            runner.config["cwd"] = old_cwd
         _active_runs[chat_id] = runner
         await runner.start("(forked — independent branch)", send_fn, update.message.chat)
 
@@ -1932,15 +2092,23 @@ async def handle_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # can't break the whole message.
     lines = [f"📂 *Recent sessions* \\({len(sessions)}\\):", ""]
     from datetime import datetime as _dt
+    # Pre-load cwd registry once (for displaying the cwd of each session)
+    cwds = _load_session_cwds()
     for s in sessions:
         age = _dt.fromtimestamp(s["ts"]).strftime("%Y-%m-%d %H:%M")
         # s['preview'] is user-controlled. md_escape() turns V2 special
         # chars into their escaped form so they're safe inside V2 markup.
         # The id backticks are intentional code formatting.
         safe_preview = md_escape(s['preview'][:80])
-        lines.append(f"`{s['id'][:8]}`  {age}  {safe_preview}")
+        # Show the cwd so the user knows which directory this session ran in
+        # (matters for /resume — claude needs to be in the same cwd).
+        cwd = cwds.get(s["id"], "")
+        cwd_part = f"  · `{md_escape(cwd)}`" if cwd else ""
+        lines.append(f"`{s['id'][:8]}`  {age}{cwd_part}")
+        lines.append(f"   {safe_preview}")
     lines.append("")
-    lines.append("Use `/resume <id>` to continue one.")
+    lines.append("Use `/resume <id>` to continue one. "
+                 "Short prefix works (e.g. `/resume 7358f245`).")
     await safe_send(update, "\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2)
 
 
@@ -2561,6 +2729,14 @@ def main():
     else:
         backend = "DISABLED"
     print(f"  Voice backend     = {backend} (model={WHISPER_LOCAL_MODEL})", flush=True)
+
+    # Backfill the (claude_session_id → cwd) registry from existing
+    # JSONL files. Without this, sessions started before the registry
+    # existed (or after the registry file got deleted) can't be
+    # /resume'd because we'd have no record of their original cwd.
+    n_backfilled = _backfill_session_cwds()
+    print(f"  Session cwd registry: {len(_load_session_cwds())} entries"
+          f" ({n_backfilled} backfilled from JSONL files)", flush=True)
 
     app.run_polling(drop_pending_updates=False)
 
