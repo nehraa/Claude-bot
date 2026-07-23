@@ -77,6 +77,12 @@ _whisper_module = None  # lazy-loaded whisper module
 _whisper_model = None    # lazy-loaded whisper model object
 
 CHECKPOINT_EVERY = int(os.getenv("CHECKPOINT_EVERY", "10"))   # checkpoint after N responses
+IDLE_FLUSH_S = float(os.getenv("IDLE_FLUSH_S", "3.0"))           # summarize after N seconds of no new activity
+# Per-tick interval for the summarization loop. Smaller = more responsive but more LLM calls.
+_SUMMARIZE_TICK_S = 1.0
+# Suppress raw event streaming once a session is "established" (one full turn done).
+# The first assistant text + first tool_use still stream so the user knows claude is alive.
+_SUPPRESS_AFTER_FIRST_TURN = True
 SILENT_FOR_STEER = int(os.getenv("SILENT_FOR_STEER", "60"))   # sec of no output before asking user
 # Stuck-session watchdog: if claude produces no events for this long AND the
 # user has pending input, kill the session so the next message starts fresh.
@@ -421,6 +427,22 @@ class ClaudeRunner:
         # inject_prompt() calls interleave at the byte level and corrupt the
         # JSON stream — claude CLI then hangs or crashes mid-session.
         self._stdin_lock = asyncio.Lock()
+        # ── Summarization state (replaces raw event streaming) ──────────
+        # Buffered events between summarization flushes. Each item is a dict
+        # with `kind` (assistant/tool_use/tool_result/result) + summary fields.
+        self._event_buffer: list[dict] = []
+        # Wall-clock (time.time()) of the LAST buffered event. Used by the
+        # summarization loop to detect IDLE_FLUSH_S of silence → emit summary.
+        self._last_event_wall_ts: float = 0.0
+        # Has the user seen the first turn yet? After this, raw event streaming
+        # is suppressed — only the steering manager's summaries go to Telegram.
+        self._first_turn_seen: bool = False
+        # True while a summary is being generated (prevent concurrent flushes).
+        self._summarizing: bool = False
+        # Background task that drives time-based + count-based summarization.
+        self._summarize_task: asyncio.Task | None = None
+        # Last summary text sent (for final dedup if needed).
+        self._last_summary_text: str = ""
         # Configurable flags (set via /agent, /add-dir, /model, /effort, /cd)
         self.config: dict = {
             "model": CLAUDE_MODEL,
@@ -514,6 +536,10 @@ class ClaudeRunner:
         # pending user input, kill the runner so the next user message
         # starts a fresh one.
         self._watchdog_task = asyncio.create_task(self._stuck_session_watchdog())
+        # Start the summarization loop. It buffers raw claude events and
+        # decides when to emit a summary to Telegram (every N events, or
+        # after IDLE_FLUSH_S of silence, or when a turn completes).
+        self._summarize_task = asyncio.create_task(self._summarization_loop())
 
     async def _stuck_session_watchdog(self):
         """Kill the session if claude is silent too long after a prompt was sent.
@@ -760,24 +786,36 @@ class ClaudeRunner:
                     if text and text != self.last_assistant_text:
                         self.last_assistant_text = text
                         self.last_event_ts = time.monotonic()
-                        # Stream to user (truncate huge outputs)
-                        preview = text[:3500] + ("\n\n[…truncated]" if len(text) > 3500 else "")
-                        await send_fn(preview)
-                        log_msg(self.chat_id, "claude", text, "text")
                         self.response_count += 1
                         bump_message_count(self.chat_id)
-                        # Notify steering manager
+                        log_msg(self.chat_id, "claude", text, "text")
+                        # Notify steering manager (records this response)
                         await self.steer_manager.on_response(self, text)
+                        # Buffer for summary instead of streaming raw.
+                        # EXCEPTION: the very first assistant turn streams so
+                        # the user knows claude is alive and processing.
+                        if not _SUPPRESS_AFTER_FIRST_TURN or not self._first_turn_seen:
+                            preview = text[:3500] + ("\n\n[…truncated]" if len(text) > 3500 else "")
+                            await send_fn(preview)
+                            self._first_turn_seen = True
+                        else:
+                            self._buffer_event({"kind": "assistant", "text": text[:1000]})
                 elif btype == "tool_use":
                     name = block.get("name", "?")
                     inp = block.get("input", {})
                     summary = inp.get("file_path", inp.get("command", inp.get("description", str(inp)[:200])))
-                    await send_fn(f"🔧 **{name}**\n`{summary}`")
                     log_event("tool_use", self.chat_id, {"tool": name, "summary": summary})
+                    # Buffer for summary. First tool_use still streams so user
+                    # sees *something* moving after session start.
+                    if not _SUPPRESS_AFTER_FIRST_TURN or not self._first_turn_seen:
+                        await send_fn(f"🔧 **{name}**\n`{summary}`")
+                        self._first_turn_seen = True
+                    else:
+                        self._buffer_event({"kind": "tool_use", "tool": name, "summary": summary})
                 elif btype == "thinking":
                     thinking = block.get("thinking", "")
                     if thinking:
-                        # Log thinking but don't spam user
+                        # Log thinking but don't spam user / don't buffer
                         log_event("claude_thinking", self.chat_id, {"thinking": thinking[:500]})
             # After assistant message, flush any pending user injects (user wants to steer mid-stream)
             await self._flush_pending_injects()
@@ -793,24 +831,105 @@ class ClaudeRunner:
                         content = "\n".join(b.get("text", "") for b in content if b.get("type") == "text")
                     preview = (content or "")[:1500]
                     if preview.strip():
-                        await send_fn(f"📥 tool result:\n```\n{md_code_escape(preview)}\n```")
                         log_event("tool_result", self.chat_id, {"content": preview[:500]})
+                        # Buffer for summary — never stream tool results raw
+                        self._buffer_event({"kind": "tool_result", "preview": preview[:500]})
             return
 
         if et == "result":
             result_text = ev.get("result", "")
             duration = ev.get("duration_ms", 0)
             cost = ev.get("total_cost_usd", 0)
-            await send_fn(f"✅ done ({duration/1000:.1f}s, ${cost:.4f})")
             log_event("claude_result", self.chat_id, {"result": result_text, "duration_ms": duration, "cost_usd": cost})
+            # Buffer the result — it'll be summarized on next flush
+            self._buffer_event({"kind": "result", "duration_ms": duration, "cost_usd": cost})
             # Flush any pending injects (this might trigger next turn)
             await self._flush_pending_injects()
             return
+
+    def _buffer_event(self, ev: dict) -> None:
+        """Append an event to the summarization buffer.
+
+        Caps buffer at 50 items so a runaway claude can't fill memory.
+        Each event is a small dict (kind + summary text), so 50 ≈ a few KB.
+        """
+        self._event_buffer.append(ev)
+        if len(self._event_buffer) > 50:
+            # Drop the oldest, keep newest 50
+            self._event_buffer = self._event_buffer[-50:]
+        self._last_event_wall_ts = time.time()
+
+    async def _summarization_loop(self) -> None:
+        """Background task: decide when to emit a summary to the user.
+
+        Three triggers:
+        (A) count-based — when >=CHECKPOINT_EVERY events buffered since last flush
+        (B) idle-based — when IDLE_FLUSH_S seconds pass with no new event
+        (C) result-based — when a "result" event is buffered (turn complete)
+
+        Runs every _SUMMARIZE_TICK_S seconds. _summarizing lock prevents
+        concurrent flushes (only one summary in flight per runner).
+        """
+        try:
+            while self._running:
+                await asyncio.sleep(_SUMMARIZE_TICK_S)
+                if not self._running or self._summarizing or not self._event_buffer:
+                    continue
+                now = time.time()
+                silent = now - self._last_event_wall_ts
+                n_events = len(self._event_buffer)
+                has_result = any(e.get("kind") == "result" for e in self._event_buffer)
+                # Trigger A: enough events accumulated
+                trigger_count = n_events >= CHECKPOINT_EVERY
+                # Trigger B: claude has been idle — emit so user sees progress
+                trigger_idle = silent >= IDLE_FLUSH_S and n_events > 0
+                # Trigger C: a turn just completed — always emit (natural break point)
+                trigger_result = has_result
+                if not (trigger_count or trigger_idle or trigger_result):
+                    continue
+                # Take a snapshot and clear — new events go into the next batch
+                batch = self._event_buffer
+                self._event_buffer = []
+                self._summarizing = True
+                try:
+                    summary = await self.steer_manager.summarize_batch(self, batch)
+                    if summary and self._send_to_user_fn and self._running:
+                        await self._send_to_user_fn(summary)
+                        self._last_summary_text = summary
+                        log_event("summary_sent", self.chat_id, {
+                            "trigger": "count" if trigger_count else ("idle" if trigger_idle else "result"),
+                            "events_in_batch": len(batch),
+                            "silent_seconds": int(silent),
+                        })
+                except Exception as e:
+                    log_event("summary_error", self.chat_id, {"error": str(e)})
+                finally:
+                    self._summarizing = False
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log_event("summarize_loop_error", self.chat_id, {"error": str(e)})
 
     async def stop(self):
         self._running = False
         if self._stdout_task and not self._stdout_task.done():
             self._stdout_task.cancel()
+        if self._watchdog_task and not self._watchdog_task.done():
+            self._watchdog_task.cancel()
+        if self._summarize_task and not self._summarize_task.done():
+            self._summarize_task.cancel()
+        # Flush any remaining buffered events as a final summary so the user
+        # knows what claude did in its last turn(s).
+        if self._event_buffer and self._send_to_user_fn:
+            try:
+                batch = self._event_buffer
+                self._event_buffer = []
+                final = await self.steer_manager.summarize_batch(self, batch)
+                if final:
+                    await self._send_to_user_fn(final)
+                    log_event("summary_final", self.chat_id, {"events_in_batch": len(batch)})
+            except Exception as e:
+                log_event("summary_final_error", self.chat_id, {"error": str(e)})
         if self.process and self.process.returncode is None:
             try:
                 self.process.terminate()
@@ -868,16 +987,18 @@ class SteeringManager:
         path.write_text(json.dumps(self.state[chat_id], indent=2, ensure_ascii=False))
 
     async def on_response(self, runner: ClaudeRunner, text: str):
-        """Called by ClaudeRunner after each assistant text response."""
+        """Called by ClaudeRunner after each assistant text response.
+
+        NOTE: The actual summarization is driven by ClaudeRunner._summarization_loop,
+        which buffers events and emits summaries based on count / idle / result triggers.
+        This method just records the response for state purposes.
+        """
         async with self.lock:
             st = self._load_state(runner.chat_id)
             st["goal"] = st.get("goal") or runner.goal
-            # Keep last 20 responses
+            # Keep last 20 responses for state continuity (e.g. across restart)
             st["last_responses"] = (st.get("last_responses", []) + [{"ts": time.time(), "text": text[:1000]}])[-20:]
             self._save_state(runner.chat_id)
-
-        if runner.response_count % CHECKPOINT_EVERY == 0:
-            await self.checkpoint(runner)
 
     async def reset_for_new_session(self, chat_id: int, new_goal: str) -> None:
         """Wipe the per-session steering state when a fresh /new is launched.
@@ -894,65 +1015,115 @@ class SteeringManager:
             self._save_state(chat_id)
 
     async def checkpoint(self, runner: ClaudeRunner):
-        """Call M3 to summarize state and decide if steering is needed."""
-        async with self.lock:
-            st = self._load_state(runner.chat_id)
-            last = st.get("last_responses", [])[-CHECKPOINT_EVERY:]
-            recent_text = "\n\n---\n\n".join(r["text"][:500] for r in last)
-            goal = st.get("goal", "")
+        """DEPRECATED — use summarize_batch() instead. Kept for back-compat
+        in case on_response() still fires it. summarise_batch() is what the
+        summarization loop actually calls now.
+        """
+        last_events = [{"kind": "assistant", "text": r["text"][:500]} for r in self._load_state(runner.chat_id).get("last_responses", [])[-CHECKPOINT_EVERY:]]
+        return await self.summarize_batch(runner, last_events)
 
-        system_prompt = """You are a steering manager for an AI coding agent.
-You monitor its work and decide when the human user needs to intervene.
-Reply in EXACTLY this format (no extra text):
+    # System prompt for the summarizer. Demands the exact format the user
+    # wants to see in Telegram — goal, current activity, decisions with
+    # options-vs-choice detail, and whether steering is needed.
+    _SUMMARY_SYSTEM = """You are a steering manager for an AI coding agent. You observe a stream of events from the agent (text responses, tool calls, tool results) and produce ONE concise Telegram summary per batch.
+
+Output rules — STRICTLY follow this format, no extra prose:
 
 <user_intent>
-What the user is trying to accomplish, inferred from their goal + the agent's recent work.
+One sentence: what the human user is trying to accomplish, inferred from their goal + the agent's recent work.
 </user_intent>
 
 <decisions>
-- bullet 1
-- bullet 2
+For each non-trivial decision the agent made in this batch:
+- was choosing: <option A>, <option B>, <option C>
+  → chose: <option X> because <1-line reason>
+If there were no real decisions (just routine work), write "none".
 </decisions>
 
 <understanding>
-What the agent is currently doing / just finished.
+One sentence: what the agent is currently doing or just finished.
 </understanding>
 
 <needs_steering>
-yes or no
+yes | no
 </needs_steering>
 
 <steer_reason>
-If needs_steering=yes, write ONE specific question to ask the user (max 200 chars).
+If needs_steering=yes, ONE specific question to ask the user (max 250 chars).
 If no, write "none".
-</steer_reason>"""
+</steer_reason>
+
+Rules:
+- Be concrete. Name files, functions, errors. No vague language.
+- "Decisions" means real choices — picking one tool over another, one approach over another, retry vs skip, etc. Routine Read/Write tool calls are NOT decisions.
+- For each decision, list the options the agent had AND what it picked. The user wants to see "I had A, B, C — picked B because...".
+- Skip events you cannot infer anything meaningful from (just a tool_result with raw data, an empty event, etc.). Aggregate where possible.
+- Output ONLY the XML-style tags above. No preamble, no closing remarks."""
+
+    async def summarize_batch(self, runner: ClaudeRunner, events: list[dict]) -> str:
+        """Call M3 to summarize a buffered batch of events.
+
+        `events` is a list of {kind, ...} dicts produced by
+        ClaudeRunner._buffer_event(). Returns a Telegram-ready markdown
+        summary string, or "" if the batch is empty / summarizer failed.
+        """
+        if not events:
+            return ""
+        # Compact event representation for the LLM. We deliberately keep
+        # this tiny — the LLM's job is summarisation, not comprehension of
+        # large raw payloads.
+        event_lines: list[str] = []
+        for ev in events:
+            kind = ev.get("kind", "?")
+            if kind == "assistant":
+                t = ev.get("text", "").strip().replace("\n", " ")
+                if t:
+                    event_lines.append(f"[assistant] {t[:400]}")
+            elif kind == "tool_use":
+                event_lines.append(f"[tool_use] {ev.get('tool', '?')}: {ev.get('summary', '')}")
+            elif kind == "tool_result":
+                p = ev.get("preview", "").strip().replace("\n", " ")
+                event_lines.append(f"[tool_result] {p[:200]}")
+            elif kind == "result":
+                event_lines.append(f"[result] duration={ev.get('duration_ms', 0)}ms cost=${ev.get('cost_usd', 0):.4f}")
+
+        if not event_lines:
+            return ""
+
+        async with self.lock:
+            st = self._load_state(runner.chat_id)
+            goal = st.get("goal") or runner.goal
 
         user_prompt = f"""## User's goal
-{goal}
+{goal or '(no explicit goal — infer from context)'}
 
-## Recent agent responses (last {len(last)})
-{recent_text}
+## Agent events since last summary ({len(events)} events)
+{chr(10).join(event_lines)}
 
-Now produce your structured assessment."""
+Produce your structured assessment now."""
 
         try:
             raw = mx_chat(
                 [{"role": "user", "content": user_prompt}],
-                system=system_prompt,
-                max_tokens=1500,
+                system=self._SUMMARY_SYSTEM,
+                max_tokens=1200,
             )
         except Exception as e:
-            log_event("steer_error", runner.chat_id, {"error": str(e)})
-            return
+            log_event("summarize_error", runner.chat_id, {"error": str(e)})
+            return ""
 
         parsed = _parse_steer_output(raw)
-        log_event("checkpoint", runner.chat_id, {"parsed": parsed, "raw": raw[:500]})
+        log_event("summary_parsed", runner.chat_id, {
+            "events_in_batch": len(events),
+            "parsed": {k: v for k, v in parsed.items() if k != "steer_reason"},
+            "raw_preview": raw[:200],
+        })
 
         async with self.lock:
             st = self._load_state(runner.chat_id)
-            st["user_intent"] = parsed.get("user_intent", "")
-            st["current_understanding"] = parsed.get("understanding", "")
-            st["decisions_made"] = parsed.get("decisions", [])
+            st["user_intent"] = parsed.get("user_intent") or st.get("user_intent", "")
+            st["current_understanding"] = parsed.get("understanding") or st.get("current_understanding", "")
+            st["decisions_made"] = parsed.get("decisions") or st.get("decisions_made", [])
             st["checkpoint_count"] = st.get("checkpoint_count", 0) + 1
             if parsed.get("needs_steering"):
                 st["steering_history"].append({
@@ -962,32 +1133,101 @@ Now produce your structured assessment."""
                 })
             self._save_state(runner.chat_id)
 
-        # Send the checkpoint summary to the user
+        # Build the user-facing summary message. NO raw event dumps. Just the LLM output.
         summary_msg = _format_checkpoint_summary(parsed, st.get("checkpoint_count", 0))
-        if runner._send_to_user_fn:
-            await runner._send_to_user_fn(summary_msg)
+        if not summary_msg:
+            return ""
 
-        # If steering needed, ask the user (debounced — only once per 5 min)
+        # If steering is needed AND the user hasn't been asked in the last 5 min,
+        # append a clear "needs your input" cue. Debounced so we don't spam.
         if parsed.get("needs_steering") and runner._user_chat:
             now = time.time()
             if now - runner.steer_asked_at > 300:
                 runner.steer_asked_at = now
-                question = parsed.get("steer_reason", "Steering needed, please advise.")
-                await runner._user_chat.send_message(
-                    f"❓ *Steering needed*\n\n{question}\n\n_(your next message will be forwarded to the agent)_",
-                    parse_mode=ParseMode.MARKDOWN,
-                )
-                log_event("steer_asked", runner.chat_id, {"question": question})
+                question = parsed.get("steer_reason", "").strip() or "Claude needs your input."
+                if question.lower() != "none":
+                    try:
+                        await runner._user_chat.send_message(
+                            f"❓ *Steering needed*\n\n{_short(question, 300)}\n\n_(your next message will be forwarded to the agent)_",
+                            parse_mode=ParseMode.MARKDOWN,
+                        )
+                        log_event("steer_asked", runner.chat_id, {"question": question})
+                    except Exception as e:
+                        log_event("steer_ask_error", runner.chat_id, {"error": str(e)})
+
+        return summary_msg
+
+    async def _checkpoint_legacy_impl(self, runner: ClaudeRunner):
+        # DELETED — old implementation removed. See summarize_batch() above.
+        # Kept as a stub so the symbol still exists if anything references it.
+        return None
 
 
 def _parse_steer_output(raw: str) -> dict:
-    """Parse the structured <tag>value</tag> output from the steering manager."""
+    """Parse the structured <tag>value</tag> output from the steering manager.
+
+    Decisions can be either:
+      - plain bullets:  - chose X
+      - single-line:   - was choosing: A, B, C → chose: B because ...
+      - multi-line:    - was choosing: A, B, C
+                        → chose: B because ...
+    All are normalised into {options, chosen, reason} dicts.
+    """
     def extract(tag):
         m = re.search(rf"<{tag}>(.*?)</{tag}>", raw, re.DOTALL)
         return m.group(1).strip() if m else ""
 
     decisions_raw = extract("decisions")
-    decisions = [d.strip("- \n") for d in decisions_raw.split("\n") if d.strip().startswith("-")]
+    decisions: list[dict] = []
+
+    # Walk lines, joining continuation lines (indented or starting with → or "->")
+    # onto the previous decision item.
+    current: dict | None = None
+    for raw_line in decisions_raw.split("\n"):
+        line = raw_line.rstrip()
+        stripped = line.lstrip()
+        if not stripped:
+            continue
+        if stripped.startswith("-"):
+            # Flush previous
+            if current is not None:
+                decisions.append(current)
+            # New decision starts
+            text = stripped.lstrip("- ").strip()
+            # Check if it's a single-line decision (has → or -> on same line)
+            if "→" in text or "->" in text:
+                sep = "→" if "→" in text else "->"
+                opts, chosen = text.split(sep, 1)
+                opts = opts.strip().lstrip("was choosing:").strip()
+                chosen_text = chosen.strip().lstrip("chose:").strip()
+                reason = ""
+                if " because " in chosen_text:
+                    chosen_text, reason = chosen_text.split(" because ", 1)
+                current = {"options": opts, "chosen": chosen_text, "reason": reason}
+            else:
+                # Could be just a plain "- chose X" or start of a multi-line
+                # "- was choosing: A, B, C" with arrow on next line.
+                opts_stripped = text.strip()
+                if opts_stripped.lower().startswith("was choosing:"):
+                    opts = opts_stripped[len("was choosing:"):].strip()
+                    current = {"options": opts, "chosen": "", "reason": ""}
+                else:
+                    current = {"options": "", "chosen": text, "reason": ""}
+        elif current is not None and (stripped.startswith("→") or stripped.startswith("->")):
+            # Continuation line — the chosen + reason
+            sep = "→" if "→" in stripped else "->"
+            chosen_text = stripped.split(sep, 1)[1].strip() if sep in stripped else stripped
+            chosen_text = chosen_text.lstrip("chose:").strip()
+            reason = ""
+            if " because " in chosen_text:
+                chosen_text, reason = chosen_text.split(" because ", 1)
+            current["chosen"] = chosen_text
+            current["reason"] = reason
+        elif current is not None:
+            # Another continuation line of "chosen" text — append to chosen
+            current["chosen"] = (current["chosen"] + " " + stripped).strip()
+    if current is not None:
+        decisions.append(current)
 
     return {
         "user_intent": extract("user_intent"),
@@ -999,19 +1239,47 @@ def _parse_steer_output(raw: str) -> dict:
 
 
 def _format_checkpoint_summary(parsed: dict, n: int) -> str:
-    lines = [f"📊 *Checkpoint #{n}*", ""]
+    """Render the LLM summary as Telegram-friendly markdown.
+
+    Structure (what the user wants):
+      🎯 What you want: <1 line>
+      📍 Claude is doing: <1 line>
+      🧠 Decisions made:
+        • Was choosing: <opts>
+          → Chose: <choice> (<reason>)
+      🤔 Needs steering? yes/no
+         → Ask user: <question>
+
+    No raw event dumps. No numeric counts. Only the LLM-curated summary.
+    """
+    lines: list[str] = []
     if parsed.get("user_intent"):
-        lines.append(f"🎯 *Goal*: {parsed['user_intent'][:300]}")
+        lines.append(f"🎯 *What you want:* {parsed['user_intent'][:300]}")
     if parsed.get("understanding"):
-        lines.append(f"📍 *Status*: {parsed['understanding'][:300]}")
-    if parsed.get("decisions"):
-        lines.append("🧠 *Decisions*:")
-        for d in parsed["decisions"][:5]:
-            lines.append(f"  • {d[:200]}")
+        lines.append(f"📍 *Claude is doing:* {parsed['understanding'][:300]}")
+    decisions = parsed.get("decisions") or []
+    if decisions:
+        lines.append("🧠 *Decisions made:*")
+        for d in decisions[:5]:
+            if d.get("options"):
+                lines.append(f"  • Was choosing: _{_short(d['options'], 180)}_")
+                reason = f" ({d['reason']})" if d.get("reason") else ""
+                lines.append(f"    → Chose: *{_short(d['chosen'], 180)}*{reason}")
+            else:
+                lines.append(f"  • {_short(d['chosen'], 250)}")
     if parsed.get("needs_steering"):
         lines.append("")
-        lines.append(f"⚠️ *Needs steering*: {parsed.get('steer_reason', '')[:200]}")
-    return "\n".join(lines)
+        lines.append("🤔 *Needs steering?* yes")
+        lines.append(f"   → {_short(parsed.get('steer_reason', ''), 300)}")
+    return "\n".join(lines) if lines else ""
+
+
+def _short(text: str, n: int) -> str:
+    """Truncate text to n chars, adding an ellipsis if cut."""
+    text = (text or "").strip()
+    if len(text) <= n:
+        return text
+    return text[: n - 1].rstrip() + "…"
 
 
 # ─────────────────────────────────────────────────────────────
