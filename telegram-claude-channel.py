@@ -78,6 +78,10 @@ _whisper_model = None    # lazy-loaded whisper model object
 
 CHECKPOINT_EVERY = int(os.getenv("CHECKPOINT_EVERY", "10"))   # checkpoint after N responses
 SILENT_FOR_STEER = int(os.getenv("SILENT_FOR_STEER", "60"))   # sec of no output before asking user
+# Stuck-session watchdog: if claude produces no events for this long AND the
+# user has pending input, kill the session so the next message starts fresh.
+# Set to ~2-3x a normal long response (which can take 30-60s on heavy queries).
+STUCK_SESSION_TIMEOUT_S = int(os.getenv("STUCK_SESSION_TIMEOUT_S", "90"))
 MAX_MSG_LEN      = 4096
 
 # Telegram MarkdownV2 reserved chars that need escaping when user content is
@@ -404,6 +408,7 @@ class ClaudeRunner:
         self.response_count = 0
         self.last_assistant_text: str = ""
         self.last_event_ts: float = 0.0
+        self._session_started_at: float = 0.0  # monotonic clock when start() began
         self.steer_asked_at: float = 0.0
         self._stdout_task: asyncio.Task | None = None
         self._pending_inject: list = []  # each item is str OR list[dict] (Anthropic content blocks)
@@ -430,10 +435,16 @@ class ClaudeRunner:
         }
 
     async def start(self, goal: str, send_fn, user_chat):
-        """Spawn the claude subprocess, send initial goal, start streaming output."""
+        """Spawn a new claude subprocess with the given goal, stream results to user."""
         self.goal = goal
         self._send_to_user_fn = send_fn
         self._user_chat = user_chat
+        self._session_started_at = time.monotonic()
+        # Reset event timestamp so the watchdog doesn't trigger immediately
+        # for sessions that take >90s to produce their first event (e.g. cold
+        # model load or first API call after a long pause).
+        if self.last_event_ts == 0.0:
+            self.last_event_ts = self._session_started_at
         self._running = True
 
         # Reset steering state for the new session so the new goal wins over any old one
@@ -498,6 +509,47 @@ class ClaudeRunner:
         except asyncio.TimeoutError:
             # Normal: process is still running after 2s
             pass
+
+        # Start the stuck-session watchdog. claude can hang silently when the
+        # LLM API is throttled or wedged — without this, the user sees
+        # "injected into running session" and then nothing forever.
+        # We track last_event_ts; if it goes >STUCK_SESSION_TIMEOUT_S with
+        # pending user input, kill the runner so the next user message
+        # starts a fresh one.
+        self._watchdog_task = asyncio.create_task(self._stuck_session_watchdog())
+
+    async def _stuck_session_watchdog(self):
+        """Kill the session if it's silent too long with pending user input.
+        Runs forever; called as a task at session start.
+        """
+        try:
+            while self._running:
+                await asyncio.sleep(15)
+                if not self._running or not self.process:
+                    return
+                # If claude is alive but has produced no event AND the user
+                # has something queued to send, it's stuck.
+                age = time.monotonic() - self.last_event_ts if self.last_event_ts else 0
+                has_pending = bool(self._pending_inject)
+                if has_pending and age > STUCK_SESSION_TIMEOUT_S:
+                    log_event("stuck_session_kill", self.chat_id, {
+                        "silent_seconds": int(age),
+                        "pending_injects": len(self._pending_inject),
+                    })
+                    try:
+                        self.process.kill()
+                    except Exception:
+                        pass
+                    if self._send_to_user_fn:
+                        await self._send_to_user_fn(
+                            f"⚠️ claude hung for {int(age)}s — killed session. "
+                            f"Send any message to start a fresh one."
+                        )
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log_event("watchdog_error", self.chat_id, {"error": str(e)})
 
     def _build_cmd(self) -> list[str]:
         """Build the claude CLI command from current config."""
