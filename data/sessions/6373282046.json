@@ -1,0 +1,11 @@
+{
+  "goal": "Hlo",
+  "user_intent": "",
+  "decisions_made": [],
+  "current_understanding": "",
+  "last_responses": [],
+  "checkpoint_count": 0,
+  "steering_history": [],
+  "checkpoint": null,
+  "steer_history": []
+}

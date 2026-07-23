@@ -87,6 +87,47 @@ def md_code_escape(text: str) -> str:
     return text.replace("\\", "\\\\").replace("```", "ʼʼʼ")
 
 
+def suggest_directory_match(missing: str, max_suggestions: int = 3) -> list[str]:
+    """Find close-match directories when a path doesn't exist.
+
+    Searches immediate parent for siblings whose name is a case-insensitive
+    near-match to the missing basename. Used by /cd, /adddir, /ls, /tree
+    to give the user a hint instead of a dead-end error.
+    """
+    missing_path = Path(missing)
+    parent = missing_path.parent
+    target = missing_path.name.lower()
+    if not parent.exists() or not parent.is_dir():
+        return []
+    try:
+        candidates = [p.name for p in parent.iterdir() if p.is_dir()]
+    except (PermissionError, OSError):
+        return []
+    # Score: case-insensitive exact match > prefix match > contains > Levenshtein
+    from difflib import get_close_matches
+    exact_ci = [c for c in candidates if c.lower() == target]
+    if exact_ci:
+        return [str(parent / exact_ci[0])]
+    prefix = [c for c in candidates if c.lower().startswith(target[:3]) and c.lower() != target]
+    if prefix:
+        return [str(parent / p) for p in prefix[:max_suggestions]]
+    fuzzy = get_close_matches(target, [c.lower() for c in candidates], n=max_suggestions, cutoff=0.6)
+    if fuzzy:
+        # Map back to original-case names
+        lc_to_orig = {c.lower(): c for c in candidates}
+        return [str(parent / lc_to_orig[f]) for f in fuzzy]
+    return []
+
+
+def path_not_found_message(missing: str) -> str:
+    """Build a 'not a directory' error with close-match suggestions."""
+    msg = f"❌ not a directory: `{missing}`"
+    suggestions = suggest_directory_match(missing)
+    if suggestions:
+        msg += "\n\nDid you mean:\n" + "\n".join(f"  • `{s}`" for s in suggestions)
+    return msg
+
+
 # Map of leading bytes → MIME type for image formats Telegram can send.
 # (We don't need to support every format — just enough that an actual
 # PNG/GIF/WebP photo doesn't get rejected by claude CLI for a wrong MIME.)
@@ -1442,7 +1483,7 @@ async def handle_cd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target = os.path.abspath(target)
 
     if not os.path.isdir(target):
-        await update.message.reply_text(f"❌ not a directory: `{target}`", do_quote=True, parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(path_not_found_message(target), do_quote=True, parse_mode=ParseMode.MARKDOWN)
         return
 
     if target == runner.config.get("cwd"):
@@ -1479,7 +1520,7 @@ async def handle_ls(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target = base
 
     if not os.path.isdir(target):
-        await update.message.reply_text(f"❌ not a directory: `{target}`", do_quote=True, parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(path_not_found_message(target), do_quote=True, parse_mode=ParseMode.MARKDOWN)
         return
 
     try:
@@ -1548,7 +1589,7 @@ async def handle_tree(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target = os.path.abspath(target)
 
     if not os.path.isdir(target):
-        await update.message.reply_text(f"❌ not a directory: `{target}`", do_quote=True, parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(path_not_found_message(target), do_quote=True, parse_mode=ParseMode.MARKDOWN)
         return
 
     lines = [f"🌳 `{target}` (depth {depth})\n"]
@@ -1652,7 +1693,7 @@ async def handle_adddir(update: Update, context: ContextTypes.DEFAULT_TYPE):
         base = (runner.config.get("cwd") if runner else None) or os.getcwd()
         path = os.path.abspath(os.path.join(base, path))
     if not os.path.isdir(path):
-        await update.message.reply_text(f"❌ not a directory: `{path}`", do_quote=True, parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(path_not_found_message(path), do_quote=True, parse_mode=ParseMode.MARKDOWN)
         return
 
     async with _runs_lock:
