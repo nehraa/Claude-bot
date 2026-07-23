@@ -642,13 +642,20 @@ class ClaudeRunner:
             CLAUDE_COMMAND, "--print",
             "--input-format", "stream-json",
             "--output-format", "stream-json",
-            "--session-id", self.session_id,
             "--model", self.config["model"],
         ]
+        # --session-id and --resume are mutually compatible ONLY when
+        # --fork-session is also passed (claude prints an error and exits
+        # code 1 otherwise). For a plain /resume we want claude to keep
+        # the original session id from the JSONL on disk, so we OMIT
+        # --session-id. For /resume --fork-session, claude creates a new
+        # session and --session-id tells it what to use.
         if self.config.get("resume"):
             cmd += ["--resume", self.config["resume"]]
-        if self.config.get("fork_session"):
-            cmd += ["--fork-session"]
+            if self.config.get("fork_session"):
+                cmd += ["--fork-session", "--session-id", self.session_id]
+        else:
+            cmd += ["--session-id", self.session_id]
         for d in self.config.get("add_dirs", []):
             cmd += ["--add-dir", d]
         if self.config.get("agent"):
