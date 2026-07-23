@@ -1437,10 +1437,13 @@ async def handle_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for s in sessions:
         from datetime import datetime as _dt
         age = _dt.fromtimestamp(s["ts"]).strftime("%Y-%m-%d %H:%M")
-        lines.append(f"`{s['id'][:8]}`  {age}  {s['preview']}")
+        # s['preview'] is user-controlled (first line of session transcript).
+        # Escape it so underscore/asterisk/bracket inside preview can't
+        # break the entire Markdown message ("Can't find end of entity").
+        lines.append(f"`{s['id'][:8]}`  {age}  {md_escape(s['preview'])}")
 
     lines.append("\nUse `/resume <id>` to continue one.")
-    await update.message.reply_text("\n".join(lines), do_quote=True, parse_mode=ParseMode.MARKDOWN)
+    await safe_send(update, "\n".join(lines))
 
 
 async def handle_pwd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1551,10 +1554,12 @@ async def handle_ls(update: Update, context: ContextTypes.DEFAULT_TYPE):
         full = os.path.join(target, name)
         try:
             if os.path.isdir(full):
-                dirs.append(f"📂 {name}/")
+                # Filenames on disk are user-controlled; escape markdown
+                # chars so an underscore in a file name doesn't break parsing.
+                dirs.append(f"📂 {md_escape(name)}/")
             else:
                 size = os.path.getsize(full)
-                files.append(f"📄 {name}  ({_format_size(size)})")
+                files.append(f"📄 {md_escape(name)}  ({_format_size(size)})")
         except OSError:
             continue
 
@@ -1571,7 +1576,7 @@ async def handle_ls(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not dirs and not files:
         lines.append("_(empty)_")
 
-    await update.message.reply_text("\n".join(lines), do_quote=True, parse_mode=ParseMode.MARKDOWN)
+    await safe_send(update, "\n".join(lines))
 
 
 async def handle_tree(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1617,7 +1622,7 @@ async def handle_tree(update: Update, context: ContextTypes.DEFAULT_TYPE):
     output = "\n".join(lines)
     if len(output) > 3500:
         output = output[:3500] + "\n\n_…truncated_"
-    await update.message.reply_text(output, do_quote=True, parse_mode=ParseMode.MARKDOWN)
+    await safe_send(update, output)
 
 
 def _tree_walk(path: str, prefix: str, depth: int, lines: list, count: list, max_entries=80):
@@ -1642,7 +1647,9 @@ def _tree_walk(path: str, prefix: str, depth: int, lines: list, count: list, max
         is_last = i == len(entries) - 1
         connector = "└── " if is_last else "├── "
         is_dir = os.path.isdir(full)
-        display = f"{name}/" if is_dir else name
+        # Escape filenames: underscores/asterisks in names are common
+        # (e.g. IELTS_Trainer, [role]) and break the whole message otherwise.
+        display = f"{md_escape(name)}/" if is_dir else md_escape(name)
         lines.append(f"{prefix}{connector}{display}")
         count[0] += 1
         if is_dir and depth > 1:
