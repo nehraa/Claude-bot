@@ -446,7 +446,7 @@ class ClaudeRunner:
         # Configurable flags (set via /agent, /add-dir, /model, /effort, /cd)
         self.config: dict = {
             "model": CLAUDE_MODEL,
-            "cwd": os.getcwd(),    # claude's working directory (set by /cd)
+            "cwd": str(Path.home()),    # claude's working directory (default = home, NOT the bot's dir)
             "add_dirs": [],        # list of paths → --add-dir
             "agent": None,         # → --agent
             "agents": None,        # → --agents (json string)
@@ -487,7 +487,7 @@ class ClaudeRunner:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env={**os.environ, "NO_COLOR": "1", "CLAUDE_CODE_SIMPLE": "1"},
-                cwd=self.config.get("cwd") or os.getcwd(),
+                cwd=self.config.get("cwd") or str(Path.home()),
             )
         except FileNotFoundError as e:
             log_event("runner_start_failed", self.chat_id, {"error": str(e)})
@@ -713,7 +713,7 @@ class ClaudeRunner:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env={**os.environ, "NO_COLOR": "1", "CLAUDE_CODE_SIMPLE": "1"},
-                cwd=self.config.get("cwd") or os.getcwd(),
+                cwd=self.config.get("cwd") or str(Path.home()),
             )
         except FileNotFoundError as e:
             log_event("runner_start_failed", self.chat_id, {"error": str(e)})
