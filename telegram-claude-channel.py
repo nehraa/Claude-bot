@@ -623,18 +623,26 @@ class ClaudeRunner:
         await self.start(self.goal, send_fn, self._user_chat)
 
     async def inject_prompt(self, prompt: str):
-        """Queue a prompt to be sent to claude on next opportunity.
-        Use this for steering interventions from the user."""
+        """Send a steering prompt to the running claude session.
+        Writes to stdin immediately under _stdin_lock — no need to wait
+        for a flush event. The original design queued injects to interleave
+        with tool-call streams, but that created a deadlock: if claude
+        hung, the queue was never drained. The _stdin_lock already serializes
+        writes safely.
+        """
         log_event("user_inject", self.chat_id, {"prompt": prompt, "goal": self.goal})
         log_msg(self.chat_id, "user", f"[steer] {prompt}", "steer")
-        # Mark the "waiting for response" timestamp NOW, not when _send_prompt
-        # eventually runs. The prompt might sit in _pending_inject for a while
-        # if claude is mid-stream, but the user's expectation is that the
-        # message has been delivered. The watchdog should fire if the queued
-        # message has been waiting >STUCK seconds without being flushed.
+        # Mark the "waiting for response" timestamp NOW. The watchdog uses
+        # this to detect "I sent a prompt >STUCK seconds ago and still no
+        # response event came back" — which is the actual stuck condition.
         self._last_prompt_sent_at = time.monotonic()
-        self._pending_inject.append(prompt)
-        self._inject_event.set()
+        # Write directly to stdin under lock. This is safe because:
+        # (1) stream-json is newline-delimited, so partial concurrent
+        #     writes can't corrupt the stream as long as they're atomic
+        #     line writes
+        # (2) the _stdin_lock wraps the write+drain to make each message
+        #     one atomic write
+        await self._send_prompt(prompt)
 
     async def _send_prompt(self, content):
         """Write a user-message JSON to claude's stdin.
