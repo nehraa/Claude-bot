@@ -19,6 +19,7 @@ import os
 import re
 import io
 import json
+import sys
 import time
 import uuid
 import asyncio
@@ -27,6 +28,7 @@ import shlex
 import sqlite3
 import subprocess
 import base64
+import tempfile
 import requests
 from datetime import datetime, timezone
 from pathlib import Path
@@ -63,6 +65,16 @@ CLAUDE_PROJECTS_DIR = Path(os.path.expanduser("~/.claude/projects"))
 WHISPER_API_KEY = os.getenv("WHISPER_API_KEY", "")
 OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+# Local Whisper: model name (tiny/base/small/medium/large) and venv path to
+# import openai-whisper from. Tiny is fast on CPU (~2.5s per 1s of audio) and
+# fine for Telegram voice notes. Set WHISPER_LOCAL=0 to force API-only.
+WHISPER_LOCAL     = os.getenv("WHISPER_LOCAL", "1") not in ("0", "false", "no", "")
+WHISPER_LOCAL_MODEL = os.getenv("WHISPER_LOCAL_MODEL", "tiny")
+# Herms-agent venv has openai-whisper + torch installed (used by the
+# practicepteonline pipeline). Reuse it instead of installing into the bot venv.
+HERMES_VENV_SITE = "/home/Hermes/.hermes/hermes-agent/venv/lib/python3.11/site-packages"
+_whisper_module = None  # lazy-loaded whisper module
+_whisper_model = None    # lazy-loaded whisper model object
 
 CHECKPOINT_EVERY = int(os.getenv("CHECKPOINT_EVERY", "10"))   # checkpoint after N responses
 SILENT_FOR_STEER = int(os.getenv("SILENT_FOR_STEER", "60"))   # sec of no output before asking user
@@ -1795,22 +1807,121 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"photo error: {e}", do_quote=True)
 
 
+def _load_whisper():
+    """Lazy-load openai-whisper from the hermes-agent venv (singleton).
+    Returns the whisper module or None if not importable.
+    """
+    global _whisper_module
+    if _whisper_module is not None:
+        return _whisper_module
+    if HERMES_VENV_SITE not in sys.path:
+        sys.path.insert(0, HERMES_VENV_SITE)
+    try:
+        import whisper  # type: ignore
+        _whisper_module = whisper
+        return whisper
+    except Exception as e:
+        logging.warning(f"local whisper import failed: {e}")
+        return None
+
+
+def _load_whisper_model():
+    """Lazy-load the whisper model (singleton, cached for process lifetime).
+    Returns (model, error_str). First load downloads model from cache (~75MB tiny).
+    """
+    global _whisper_model
+    if _whisper_model is not None:
+        return _whisper_model, None
+    whisper = _load_whisper()
+    if whisper is None:
+        return None, "openai-whisper not importable from hermes-agent venv"
+    try:
+        # Force CPU since this server has no GPU
+        os.environ.setdefault("WHISPER_NO_GPU", "1")
+        logging.info(f"loading whisper model: {WHISPER_LOCAL_MODEL}")
+        t0 = time.time()
+        _whisper_model = whisper.load_model(WHISPER_LOCAL_MODEL)
+        logging.info(f"whisper model loaded in {time.time() - t0:.1f}s")
+        return _whisper_model, None
+    except Exception as e:
+        return None, f"whisper.load_model({WHISPER_LOCAL_MODEL!r}) failed: {e}"
+
+
+def transcribe_audio(audio_bytes: bytes, suffix: str = ".ogg") -> str:
+    """Transcribe audio to text. Tries local whisper first, falls back to OpenAI API.
+
+    Returns the transcribed text. Raises on failure.
+    """
+    # Path 1: local openai-whisper (free, private, no key, no network)
+    if WHISPER_LOCAL:
+        model, err = _load_whisper_model()
+        if model is not None:
+            try:
+                # whisper.transcribe needs a file path; write to a temp file
+                # because it uses ffmpeg under the hood for .ogg/.webm/etc.
+                with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                    tmp.write(audio_bytes)
+                    tmp_path = tmp.name
+                try:
+                    t0 = time.time()
+                    result = model.transcribe(
+                        tmp_path,
+                        fp16=False,  # CPU only
+                        verbose=None,
+                    )
+                    text = (result.get("text") or "").strip()
+                    logging.info(
+                        f"whisper local: {len(audio_bytes)}B in {time.time() - t0:.1f}s "
+                        f"-> {len(text)} chars"
+                    )
+                    return text
+                finally:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+            except Exception as e:
+                logging.warning(f"local whisper transcribe failed: {e}")
+                # fall through to API
+        else:
+            logging.info(f"local whisper unavailable ({err}), trying API")
+
+    # Path 2: OpenAI Whisper API (paid, requires key)
+    api_key = WHISPER_API_KEY or OPENAI_API_KEY
+    if api_key:
+        resp = requests.post(
+            f"{OPENAI_BASE_URL}/audio/transcriptions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            files={"file": (f"voice{suffix}", audio_bytes, f"audio/{suffix.lstrip('.')}")},
+            data={"model": "whisper-1", "language": "en"},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        return resp.json().get("text", "").strip()
+
+    raise RuntimeError(
+        "no transcription backend: local whisper failed AND "
+        "WHISPER_API_KEY/OPENAI_API_KEY not set in .env"
+    )
+
+
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Download voice, transcribe via Whisper, inject text into session."""
     chat_id = update.message.chat_id
     if not update.message.voice:
         return
-    api_key = WHISPER_API_KEY or OPENAI_API_KEY
-    if not api_key:
-        # Clear (not consume) the pending /new goal so the next typed text still wins
-        await _clear_pending_goal(chat_id)
+    # Clear (not consume) the pending /new goal so the next typed text still wins
+    await _clear_pending_goal(chat_id)
+
+    # If user has explicitly disabled local whisper AND has no API key, fail fast
+    if not WHISPER_LOCAL and not (WHISPER_API_KEY or OPENAI_API_KEY):
         await update.message.reply_text(
-            "voice transcription requires WHISPER_API_KEY or OPENAI_API_KEY in .env",
+            "voice transcription needs WHISPER_API_KEY or OPENAI_API_KEY in .env "
+            "(local whisper disabled via WHISPER_LOCAL=0)",
             do_quote=True,
         )
         return
-    # Clear (not consume) the pending /new goal so the next typed text still wins
-    await _clear_pending_goal(chat_id)
+    # Show a quick "transcribing" hint unless local whisper loaded super fast
     await update.message.reply_text("🎙 transcribing…", do_quote=True)
     try:
         voice = update.message.voice
@@ -1819,22 +1930,17 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await file.download_to_memory(buf)
         ogg_bytes = buf.getvalue()
 
-        # Whisper API
-        resp = requests.post(
-            f"{OPENAI_BASE_URL}/audio/transcriptions",
-            headers={"Authorization": f"Bearer {api_key}"},
-            files={"file": ("voice.ogg", ogg_bytes, "audio/ogg")},
-            data={"model": "whisper-1", "language": "en"},
-            timeout=60,
-        )
-        resp.raise_for_status()
-        text = resp.json().get("text", "").strip()
+        # Transcribe (local first, API fallback). .ogg for Telegram voice notes.
+        text = await asyncio.to_thread(transcribe_audio, ogg_bytes, ".ogg")
         if not text:
             await update.message.reply_text("(no speech detected)", do_quote=True)
             return
 
         await update.message.reply_text(f"🎙 {text}", do_quote=True)
-        log_event("user_voice", chat_id, {"text": text, "duration": voice.duration})
+        log_event("user_voice", chat_id, {
+            "text": text, "duration": voice.duration,
+            "backend": "local" if WHISPER_LOCAL else "api",
+        })
 
         async with _runs_lock:
             runner = _active_runs.get(chat_id)
@@ -1929,6 +2035,16 @@ def main():
     print(f"  Training log dir  = {LOG_DIR}", flush=True)
     print(f"  Session state dir = {SESSION_DIR}", flush=True)
     print(f"  DB                = {DB_PATH}", flush=True)
+    # Voice transcription status (helps debug "voice error: ..." at 3am)
+    if WHISPER_LOCAL and (WHISPER_API_KEY or OPENAI_API_KEY):
+        backend = "local+api"
+    elif WHISPER_LOCAL:
+        backend = "local"
+    elif WHISPER_API_KEY or OPENAI_API_KEY:
+        backend = "api"
+    else:
+        backend = "DISABLED"
+    print(f"  Voice backend     = {backend} (model={WHISPER_LOCAL_MODEL})", flush=True)
 
     app.run_polling(drop_pending_updates=False)
 
