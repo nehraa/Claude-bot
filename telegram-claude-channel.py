@@ -173,24 +173,39 @@ def sniff_image_mime(img_bytes: bytes) -> str:
     return "image/jpeg"
 
 
-async def safe_send(update, text: str, parse_mode=ParseMode.MARKDOWN, **kwargs):
+async def safe_send(update, text: str, parse_mode=ParseMode.MARKDOWN_V2, **kwargs):
     """Send a Telegram message, falling back through MarkdownV2 -> plain text on parse failure.
 
     Use this for any message that includes user-generated or tool-result content
     that may contain MarkdownV2 special chars (_, *, [, ], etc.).
+
+    BUGS FIXED in this version:
+      - `bot.send_message()` does NOT accept `do_quote` (that's for
+        update.message.reply_text()). Passing it crashed every call with
+        TypeError, which silently black-holed the entire /sessions output
+        and probably other handlers too.
+      - Fallback used `md_escape()` (V2 escapes) with `ParseMode.MARKDOWN`
+        (V1), a guaranteed parse failure that looped back into the same
+        exception path. Fixed: if first attempt fails, drop parse_mode and
+        re-send as plain text. md_escape is still used for the V2
+        success-path so user content survives.
     """
-    bot = update.effective_message.get_bot() if update.effective_message else update.bot
+    bot = update.get_bot() if hasattr(update, "get_bot") else update.bot
     chat_id = update.effective_chat.id if update.effective_chat else update.message.chat_id
-    do_quote = kwargs.pop("do_quote", True)
     try:
-        await bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode, do_quote=do_quote, **kwargs)
+        await bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode, **kwargs)
     except Exception as e:
-        # Markdown parse failed — try with everything escaped
+        # Markdown parse failed — try with everything escaped (still V2)
         try:
-            await bot.send_message(chat_id=chat_id, text=md_escape(text), parse_mode=parse_mode, do_quote=do_quote, **kwargs)
+            await bot.send_message(chat_id=chat_id, text=md_escape(text), parse_mode=ParseMode.MARKDOWN_V2, **kwargs)
         except Exception:
-            # Still failed — send as plain text
-            await bot.send_message(chat_id=chat_id, text=text, do_quote=do_quote, **kwargs)
+            # Still failed — send as plain text, no parse mode at all
+            try:
+                await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+            except Exception as e2:
+                # Last resort: log and give up. The user will see nothing but
+                # the gateway won't crash.
+                log_event("safe_send_failed", update.effective_chat.id if update.effective_chat else 0, {"error": str(e2)})
 DB_PATH          = Path(__file__).parent / "conversations.db"
 LOG_DIR          = Path(__file__).parent / "data" / "training_log"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -1813,17 +1828,21 @@ async def handle_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sessions.sort(key=lambda s: s["ts"], reverse=True)
     sessions = sessions[:15]
 
-    lines = [f"📂 *Recent sessions* ({len(sessions)}):", ""]
+    # Build the message. Use MarkdownV2 — escape every literal that isn't
+    # intentionally Markdown so underscores/asterisks in user previews
+    # can't break the whole message.
+    lines = [f"📂 *Recent sessions* \\({len(sessions)}\\):", ""]
     from datetime import datetime as _dt
     for s in sessions:
         age = _dt.fromtimestamp(s["ts"]).strftime("%Y-%m-%d %H:%M")
-        # s['preview'] is user-controlled (first user message). Escape it
-        # so underscore/asterisk/bracket inside can't break the entire
-        # Markdown message ("Can't find end of entity").
-        lines.append(f"`{s['id'][:8]}`  {age}  {md_escape(s['preview'][:80])}")
+        # s['preview'] is user-controlled. md_escape() turns V2 special
+        # chars into their escaped form so they're safe inside V2 markup.
+        # The id backticks are intentional code formatting.
+        safe_preview = md_escape(s['preview'][:80])
+        lines.append(f"`{s['id'][:8]}`  {age}  {safe_preview}")
     lines.append("")
     lines.append("Use `/resume <id>` to continue one.")
-    await safe_send(update, "\n".join(lines))
+    await safe_send(update, "\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2)
 
 
 async def handle_pwd(update: Update, context: ContextTypes.DEFAULT_TYPE):
