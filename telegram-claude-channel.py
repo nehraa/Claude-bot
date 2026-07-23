@@ -562,7 +562,13 @@ class ClaudeRunner:
         # We track last_event_ts; if it goes >STUCK_SESSION_TIMEOUT_S with
         # pending user input, kill the runner so the next user message
         # starts a fresh one.
-        self._watchdog_task = asyncio.create_task(self._stuck_session_watchdog())
+        # Watchdog DISABLED (Jul 23 2026) — was killing legitimate long
+        # thinking+tool chains. Re-enable when the underlying bug is
+        # found (something is bumping _last_prompt_sent_at or
+        # _pending_prompt_queued_at unexpectedly). For now: trust the
+        # user to /cancel if it's truly stuck.
+        # self._watchdog_task = asyncio.create_task(self._stuck_session_watchdog())
+        self._watchdog_task = None
         # Start the summarization loop. It buffers raw claude events and
         # decides when to emit a summary to Telegram (every N events, or
         # after IDLE_FLUSH_S of silence, or when a turn completes).
