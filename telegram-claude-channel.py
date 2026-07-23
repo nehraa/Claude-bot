@@ -1887,8 +1887,8 @@ async def handle_cd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not target:
-        # /cd with no arg → bot cwd
-        target = os.getcwd()
+        # /cd with no arg → home (same default a fresh session uses)
+        target = str(Path.home())
     else:
         # Resolve ~ and relative paths against current session cwd
         target = os.path.expanduser(target)
@@ -1923,7 +1923,7 @@ async def handle_ls(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     async with _runs_lock:
         runner = _active_runs.get(chat_id)
-    base = (runner.config.get("cwd") if runner else None) or os.getcwd()
+    base = (runner.config.get("cwd") if runner else None) or str(Path.home())
 
     if arg:
         target = os.path.expanduser(arg)
@@ -1975,7 +1975,18 @@ async def handle_ls(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not dirs and not files:
         lines.append("_(empty)_")
 
-    await safe_send(update, "\n".join(lines))
+    # /ls uses MarkdownV2 (matches safe_send's default). md_escape() on
+    # filenames produces V2 escapes; the parens around file size need
+    # explicit V2 escaping too.
+    safe_lines = []
+    for line in lines:
+        if line.startswith("📂 ") or line.startswith("📄 "):
+            # md_escape already escaped user-controlled filename chars.
+            # Now also escape V2-significant chars in the static prefix.
+            safe_lines.append(line.replace("(", "\\(").replace(")", "\\)"))
+        else:
+            safe_lines.append(line)
+    await safe_send(update, "\n".join(safe_lines), parse_mode=ParseMode.MARKDOWN_V2)
 
 
 async def handle_tree(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1996,7 +2007,7 @@ async def handle_tree(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     async with _runs_lock:
         runner = _active_runs.get(chat_id)
-    base = (runner.config.get("cwd") if runner else None) or os.getcwd()
+    base = (runner.config.get("cwd") if runner else None) or str(Path.home())
 
     target = arg or base
     target = os.path.expanduser(target)
@@ -2108,7 +2119,7 @@ async def handle_adddir(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Resolve relative to session cwd if available, else bot cwd
         async with _runs_lock:
             runner = _active_runs.get(chat_id)
-        base = (runner.config.get("cwd") if runner else None) or os.getcwd()
+        base = (runner.config.get("cwd") if runner else None) or str(Path.home())
         path = os.path.abspath(os.path.join(base, path))
     if not os.path.isdir(path):
         await update.message.reply_text(path_not_found_message(path), do_quote=True, parse_mode=ParseMode.MARKDOWN)
