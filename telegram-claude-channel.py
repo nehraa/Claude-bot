@@ -524,22 +524,30 @@ class ClaudeRunner:
                 await asyncio.sleep(10)
                 if not self._running or not self.process:
                     return
-                # The actual stuck condition: we sent a prompt >STUCK seconds
-                # ago and still no response event came back. last_event_ts
-                # alone won't catch this (a session can be "recent" if a prior
-                # prompt got a response, then a new prompt gets stuck).
+                # The actual stuck condition: a prompt was sent/queued >STUCK
+                # seconds ago and still no response event came back.
                 if not self._last_prompt_sent_at:
                     continue
                 since_prompt = time.monotonic() - self._last_prompt_sent_at
                 if since_prompt < STUCK_SESSION_TIMEOUT_S:
                     continue
-                # Check if there's been any event since the prompt was sent.
-                # If last_event_ts > _last_prompt_sent_at, we got a response.
-                if self.last_event_ts > self._last_prompt_sent_at:
+                # Two ways to be stuck:
+                # (A) prompt was sent and we got NO event since
+                if self.last_event_ts <= self._last_prompt_sent_at:
+                    pass  # stuck: prompt sent, no response
+                # (B) prompt is still queued (not yet sent to claude) — this
+                #     happens when the user sends during a long-running turn
+                #     and _flush_pending_injects never runs (no events at all).
+                elif self._pending_inject:
+                    pass  # stuck: prompt queued but never flushed
+                else:
+                    # got a response after the prompt, not stuck
                     continue
                 log_event("stuck_session_kill", self.chat_id, {
                     "silent_seconds": int(since_prompt),
                     "pending_injects": len(self._pending_inject),
+                    "last_event_ts": self.last_event_ts,
+                    "last_prompt_sent_at": self._last_prompt_sent_at,
                 })
                 try:
                     self.process.kill()
@@ -619,6 +627,12 @@ class ClaudeRunner:
         Use this for steering interventions from the user."""
         log_event("user_inject", self.chat_id, {"prompt": prompt, "goal": self.goal})
         log_msg(self.chat_id, "user", f"[steer] {prompt}", "steer")
+        # Mark the "waiting for response" timestamp NOW, not when _send_prompt
+        # eventually runs. The prompt might sit in _pending_inject for a while
+        # if claude is mid-stream, but the user's expectation is that the
+        # message has been delivered. The watchdog should fire if the queued
+        # message has been waiting >STUCK seconds without being flushed.
+        self._last_prompt_sent_at = time.monotonic()
         self._pending_inject.append(prompt)
         self._inject_event.set()
 
