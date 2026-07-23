@@ -491,6 +491,9 @@ class ClaudeRunner:
         # Reset steering state for the new session so the new goal wins over any old one
         if self.steer_manager is not None:
             await self.steer_manager.reset_for_new_session(self.chat_id, goal)
+            # Record the initial goal as the first user prompt so it's
+            # visible to the summarizer in the user_prompts[] list.
+            await self.steer_manager.on_user_prompt(self, goal)
 
         # Reset watchdog timestamps for the new session
         self._pending_prompt_queued_at = 0.0
@@ -700,6 +703,13 @@ class ClaudeRunner:
         """
         log_event("user_inject", self.chat_id, {"prompt": prompt, "goal": self.goal})
         log_msg(self.chat_id, "user", f"[steer] {prompt}", "steer")
+        # Record the prompt with the steering manager so the LLM sees
+        # the cumulative intent (not just the original /new goal).
+        if self.steer_manager is not None:
+            try:
+                await self.steer_manager.on_user_prompt(self, prompt)
+            except Exception as e:
+                log_event("on_user_prompt_error", self.chat_id, {"error": str(e)})
         # Mark "user wants a response" timestamp. The watchdog uses this
         # (combined with last_event_ts) to detect "user sent something
         # and we're not getting any events back from claude."
@@ -1015,24 +1025,34 @@ class SteeringManager:
         return SESSION_DIR / f"{chat_id}.json"
 
     def _load_state(self, chat_id: int) -> dict:
-        if chat_id in self.state:
-            return self.state[chat_id]
-        path = self._state_file(chat_id)
-        if path.exists():
-            try:
-                self.state[chat_id] = json.loads(path.read_text())
-                return self.state[chat_id]
-            except Exception:
-                pass
-        self.state[chat_id] = {
+        defaults = {
             "goal": "",
             "user_intent": "",
             "decisions_made": [],
             "current_understanding": "",
             "last_responses": [],
+            "user_prompts": [],   # full history of what the user has sent (last 30)
             "checkpoint_count": 0,
             "steering_history": [],
         }
+        if chat_id in self.state:
+            # Merge defaults so new fields added in later versions exist
+            for k, v in defaults.items():
+                self.state[chat_id].setdefault(k, v)
+            return self.state[chat_id]
+        path = self._state_file(chat_id)
+        if path.exists():
+            try:
+                loaded = json.loads(path.read_text())
+                # Merge defaults — preserve on-disk data but ensure all
+                # new fields exist. Critical for upgrades where an old
+                # state file lacks fields added in a newer version.
+                merged = {**defaults, **loaded}
+                self.state[chat_id] = merged
+                return merged
+            except Exception:
+                pass
+        self.state[chat_id] = dict(defaults)
         return self.state[chat_id]
 
     def _save_state(self, chat_id: int):
@@ -1053,6 +1073,27 @@ class SteeringManager:
             st["last_responses"] = (st.get("last_responses", []) + [{"ts": time.time(), "text": text[:1000]}])[-20:]
             self._save_state(runner.chat_id)
 
+    async def on_user_prompt(self, runner: ClaudeRunner, prompt: str) -> None:
+        """Record every user prompt sent to claude. Without this, the
+        steering manager only ever sees the FIRST prompt (set as the
+        initial goal) — follow-up prompts like "do option 2", "now write
+        the tests", "actually skip that" are invisible to it. The LLM
+        then keeps asking "what do you actually want?" forever.
+
+        Stores the last 30 user prompts in state['user_prompts'] so the
+        summarizer can include them in the user_intent reasoning.
+        """
+        async with self.lock:
+            st = self._load_state(runner.chat_id)
+            # Update the "current goal" to the latest prompt — that's the
+            # best single-sentence description of what the user is working
+            # on right now. Older goals stay in user_prompts[] for context.
+            st["goal"] = prompt
+            st["user_prompts"] = (
+                st.get("user_prompts", []) + [{"ts": time.time(), "text": prompt[:1500]}]
+            )[-30:]
+            self._save_state(runner.chat_id)
+
     async def reset_for_new_session(self, chat_id: int, new_goal: str) -> None:
         """Wipe the per-session steering state when a fresh /new is launched.
 
@@ -1063,6 +1104,7 @@ class SteeringManager:
             st = self._load_state(chat_id)
             st["goal"] = new_goal
             st["last_responses"] = []
+            st["user_prompts"] = []  # start fresh — on_user_prompt will repopulate
             st["checkpoint"] = None
             st["steer_history"] = []
             self._save_state(chat_id)
@@ -1146,12 +1188,31 @@ Rules:
         async with self.lock:
             st = self._load_state(runner.chat_id)
             goal = st.get("goal") or runner.goal
+            # Build the full user-prompt history (last 30). This is what
+            # the LLM should reason about when answering "what does the
+            # user want" — not just the original goal. Old prompts show
+            # how the intent evolved; the latest prompt is what the user
+            # actually asked for RIGHT NOW.
+            user_prompts = st.get("user_prompts", []) or []
+            if user_prompts:
+                prompt_lines = []
+                for i, p in enumerate(user_prompts, 1):
+                    txt = (p.get("text") or "").strip().replace("\n", " ")
+                    prompt_lines.append(f"  {i}. {txt[:400]}")
+                prompts_block = "\n".join(prompt_lines)
+            else:
+                prompts_block = "  (no user prompts recorded yet)"
 
-        user_prompt = f"""## User's goal
+        user_prompt = f"""## User's goal (latest, for quick reference)
 {goal or '(no explicit goal — infer from context)'}
+
+## Full user prompt history (most recent is the current intent, older = how it evolved)
+{prompts_block}
 
 ## Agent events since last summary ({len(events)} events)
 {chr(10).join(event_lines)}
+
+When answering "what does the user want?" (the <user_intent> field), reason about the FULL user prompt history — especially the latest prompt, which represents the current request. Older prompts provide context for how the task evolved. Don't pretend the user only sent the first message; the user has steered multiple times and the latest steering is what matters.
 
 Produce your structured assessment now."""
 
