@@ -87,7 +87,7 @@ SILENT_FOR_STEER = int(os.getenv("SILENT_FOR_STEER", "60"))   # sec of no output
 # Stuck-session watchdog: if claude produces no events for this long AND the
 # user has pending input, kill the session so the next message starts fresh.
 # Set to ~2-3x a normal long response (which can take 30-60s on heavy queries).
-STUCK_SESSION_TIMEOUT_S = int(os.getenv("STUCK_SESSION_TIMEOUT_S", "90"))
+STUCK_SESSION_TIMEOUT_S = int(os.getenv("STUCK_SESSION_TIMEOUT_S", "180"))
 MAX_MSG_LEN      = 4096
 
 # Telegram MarkdownV2 reserved chars that need escaping when user content is
@@ -442,6 +442,13 @@ class ClaudeRunner:
         # inject_prompt() calls interleave at the byte level and corrupt the
         # JSON stream — claude CLI then hangs or crashes mid-session.
         self._stdin_lock = asyncio.Lock()
+        # Wall-clock of when the most recent user prompt was QUEUED (i.e.
+        # inject_prompt() was called). Distinct from _last_prompt_sent_at
+        # (which is set when the prompt actually reached claude's stdin).
+        # The watchdog uses this to detect "user sent something and we
+        # still haven't even flushed it to claude yet" — different from
+        # "we sent it and got no response."
+        self._pending_prompt_queued_at: float = 0.0
         # ── Summarization state (replaces raw event streaming) ──────────
         # Buffered events between summarization flushes. Each item is a dict
         # with `kind` (assistant/tool_use/tool_result/result) + summary fields.
@@ -484,6 +491,11 @@ class ClaudeRunner:
         # Reset steering state for the new session so the new goal wins over any old one
         if self.steer_manager is not None:
             await self.steer_manager.reset_for_new_session(self.chat_id, goal)
+
+        # Reset watchdog timestamps for the new session
+        self._pending_prompt_queued_at = 0.0
+        self._last_prompt_sent_at = 0.0
+        self.last_event_ts = time.monotonic()  # start the clock NOW — anything before this is irrelevant
 
         # Build claude command from current config
         cmd = self._build_cmd()
@@ -557,36 +569,45 @@ class ClaudeRunner:
         self._summarize_task = asyncio.create_task(self._summarization_loop())
 
     async def _stuck_session_watchdog(self):
-        """Kill the session if claude is silent too long after a prompt was sent.
-        Runs forever; called as a task at session start.
+        """Kill the session if claude is silent too long.
+
+        The actual stuck condition: claude has produced no events for
+        STUCK_SESSION_TIMEOUT_S seconds AND the user has pending input
+        waiting. Without "pending input" the watchdog is silent — a long
+        thinking turn is fine, the user just hasn't asked anything yet.
+
+        BUG FIX v3.8.5: prior versions keyed on `last_event_ts <=
+        _last_prompt_sent_at`, which misfired whenever _last_prompt_sent_at
+        got bumped by a non-user-inject call (e.g. _flush_pending_injects
+        flushing a stale image queue, or inject_prompt re-bumping on
+        retry). The new condition uses the simpler "no events for N
+        seconds" check, gated on `_pending_prompt_queued_at` (real
+        user-pending input) OR `_last_prompt_sent_at > last_event_ts`
+        (something was sent and we're still waiting for any kind of reply).
         """
         try:
             while self._running:
                 await asyncio.sleep(10)
                 if not self._running or not self.process:
                     return
-                # The actual stuck condition: a prompt was sent/queued >STUCK
-                # seconds ago and still no response event came back.
-                if not self._last_prompt_sent_at:
+                now = time.monotonic()
+                # No events at all since the last one — and it's been a while
+                silent = now - self.last_event_ts if self.last_event_ts else 0
+                if silent < STUCK_SESSION_TIMEOUT_S:
                     continue
-                since_prompt = time.monotonic() - self._last_prompt_sent_at
-                if since_prompt < STUCK_SESSION_TIMEOUT_S:
+                # Only fire if there's pending user input. Idle claude doing
+                # long thinking without user input is NOT stuck.
+                pending_input = (
+                    self._pending_prompt_queued_at > 0
+                    or (self._last_prompt_sent_at > 0 and self._last_prompt_sent_at > self.last_event_ts)
+                )
+                if not pending_input:
                     continue
-                # Two ways to be stuck:
-                # (A) prompt was sent and we got NO event since
-                if self.last_event_ts <= self._last_prompt_sent_at:
-                    pass  # stuck: prompt sent, no response
-                # (B) prompt is still queued (not yet sent to claude) — this
-                #     happens when the user sends during a long-running turn
-                #     and _flush_pending_injects never runs (no events at all).
-                elif self._pending_inject:
-                    pass  # stuck: prompt queued but never flushed
-                else:
-                    # got a response after the prompt, not stuck
-                    continue
+                # Pending input + no events for STUCK_SESSION_TIMEOUT_S
+                # → claude is genuinely stuck.
                 log_event("stuck_session_kill", self.chat_id, {
-                    "silent_seconds": int(since_prompt),
-                    "pending_injects": len(self._pending_inject),
+                    "silent_seconds": int(silent),
+                    "pending_prompt_queued_at": self._pending_prompt_queued_at,
                     "last_event_ts": self.last_event_ts,
                     "last_prompt_sent_at": self._last_prompt_sent_at,
                 })
@@ -596,7 +617,7 @@ class ClaudeRunner:
                     pass
                 if self._send_to_user_fn:
                     await self._send_to_user_fn(
-                        f"⚠️ claude hung for {int(since_prompt)}s after prompt — "
+                        f"⚠️ claude silent for {int(silent)}s with pending input — "
                         f"killed session. Send any message to start a fresh one."
                     )
                 return
@@ -673,16 +694,18 @@ class ClaudeRunner:
         """
         log_event("user_inject", self.chat_id, {"prompt": prompt, "goal": self.goal})
         log_msg(self.chat_id, "user", f"[steer] {prompt}", "steer")
-        # Mark the "waiting for response" timestamp NOW. The watchdog uses
-        # this to detect "I sent a prompt >STUCK seconds ago and still no
-        # response event came back" — which is the actual stuck condition.
-        self._last_prompt_sent_at = time.monotonic()
+        # Mark "user wants a response" timestamp. The watchdog uses this
+        # (combined with last_event_ts) to detect "user sent something
+        # and we're not getting any events back from claude."
+        self._pending_prompt_queued_at = time.monotonic()
         # Write directly to stdin under lock. This is safe because:
         # (1) stream-json is newline-delimited, so partial concurrent
         #     writes can't corrupt the stream as long as they're atomic
         #     line writes
         # (2) the _stdin_lock wraps the write+drain to make each message
         #     one atomic write
+        # _send_prompt() will also set _last_prompt_sent_at when the
+        # bytes actually reach claude's stdin.
         await self._send_prompt(prompt)
 
     async def _send_prompt(self, content):
@@ -786,9 +809,19 @@ class ClaudeRunner:
         et = ev.get("type")
         log_event("claude_event", self.chat_id, {"event_type": et, "event": ev})
 
+        # Update liveness timestamp on EVERY event from claude, regardless
+        # of type. BUG FIX v3.8.5: prior versions only updated on
+        # assistant/text blocks, so long thinking+tool_use+tool_result
+        # chains (no text) appeared as "stuck" to the watchdog.
+        # Now: if claude is producing any events at all, the watchdog is silent.
+        self.last_event_ts = time.monotonic()
+        # If we were waiting for a response, the response is starting now.
+        # Clear the queued-prompt marker so the watchdog doesn't fire on
+        # pending-input alone.
+        self._pending_prompt_queued_at = 0.0
+
         if et == "system" and ev.get("subtype") == "init":
             self.claude_session_id = ev.get("session_id") or self.session_id
-            self.last_event_ts = time.monotonic()
             return
 
         if et == "assistant":
@@ -800,7 +833,6 @@ class ClaudeRunner:
                     text = block.get("text", "")
                     if text and text != self.last_assistant_text:
                         self.last_assistant_text = text
-                        self.last_event_ts = time.monotonic()
                         self.response_count += 1
                         bump_message_count(self.chat_id)
                         log_msg(self.chat_id, "claude", text, "text")
