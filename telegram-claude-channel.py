@@ -409,6 +409,7 @@ class ClaudeRunner:
         self.last_assistant_text: str = ""
         self.last_event_ts: float = 0.0
         self._session_started_at: float = 0.0  # monotonic clock when start() began
+        self._last_prompt_sent_at: float = 0.0  # monotonic clock when last prompt was sent to claude
         self.steer_asked_at: float = 0.0
         self._stdout_task: asyncio.Task | None = None
         self._pending_inject: list = []  # each item is str OR list[dict] (Anthropic content blocks)
@@ -440,11 +441,7 @@ class ClaudeRunner:
         self._send_to_user_fn = send_fn
         self._user_chat = user_chat
         self._session_started_at = time.monotonic()
-        # Reset event timestamp so the watchdog doesn't trigger immediately
-        # for sessions that take >90s to produce their first event (e.g. cold
-        # model load or first API call after a long pause).
-        if self.last_event_ts == 0.0:
-            self.last_event_ts = self._session_started_at
+        self._last_prompt_sent_at = 0.0  # will be set when _send_prompt runs
         self._running = True
 
         # Reset steering state for the new session so the new goal wins over any old one
@@ -519,33 +516,41 @@ class ClaudeRunner:
         self._watchdog_task = asyncio.create_task(self._stuck_session_watchdog())
 
     async def _stuck_session_watchdog(self):
-        """Kill the session if it's silent too long with pending user input.
+        """Kill the session if claude is silent too long after a prompt was sent.
         Runs forever; called as a task at session start.
         """
         try:
             while self._running:
-                await asyncio.sleep(15)
+                await asyncio.sleep(10)
                 if not self._running or not self.process:
                     return
-                # If claude is alive but has produced no event AND the user
-                # has something queued to send, it's stuck.
-                age = time.monotonic() - self.last_event_ts if self.last_event_ts else 0
-                has_pending = bool(self._pending_inject)
-                if has_pending and age > STUCK_SESSION_TIMEOUT_S:
-                    log_event("stuck_session_kill", self.chat_id, {
-                        "silent_seconds": int(age),
-                        "pending_injects": len(self._pending_inject),
-                    })
-                    try:
-                        self.process.kill()
-                    except Exception:
-                        pass
-                    if self._send_to_user_fn:
-                        await self._send_to_user_fn(
-                            f"⚠️ claude hung for {int(age)}s — killed session. "
-                            f"Send any message to start a fresh one."
-                        )
-                    return
+                # The actual stuck condition: we sent a prompt >STUCK seconds
+                # ago and still no response event came back. last_event_ts
+                # alone won't catch this (a session can be "recent" if a prior
+                # prompt got a response, then a new prompt gets stuck).
+                if not self._last_prompt_sent_at:
+                    continue
+                since_prompt = time.monotonic() - self._last_prompt_sent_at
+                if since_prompt < STUCK_SESSION_TIMEOUT_S:
+                    continue
+                # Check if there's been any event since the prompt was sent.
+                # If last_event_ts > _last_prompt_sent_at, we got a response.
+                if self.last_event_ts > self._last_prompt_sent_at:
+                    continue
+                log_event("stuck_session_kill", self.chat_id, {
+                    "silent_seconds": int(since_prompt),
+                    "pending_injects": len(self._pending_inject),
+                })
+                try:
+                    self.process.kill()
+                except Exception:
+                    pass
+                if self._send_to_user_fn:
+                    await self._send_to_user_fn(
+                        f"⚠️ claude hung for {int(since_prompt)}s after prompt — "
+                        f"killed session. Send any message to start a fresh one."
+                    )
+                return
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -626,6 +631,11 @@ class ClaudeRunner:
             content = [{"type": "text", "text": content}]
         msg = {"type": "user", "message": {"role": "user", "content": content}}
         line = json.dumps(msg) + "\n"
+        # Mark "waiting for response" timestamp BEFORE writing to stdin.
+        # The watchdog uses this to detect "I sent a prompt >90s ago and
+        # still no response event came back" — which is the actual stuck
+        # condition. last_event_ts is updated when a response arrives.
+        self._last_prompt_sent_at = time.monotonic()
         async with self._stdin_lock:
             try:
                 self.process.stdin.write(line.encode("utf-8"))
