@@ -1741,33 +1741,58 @@ async def handle_set_effort(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """`/sessions` — list recent claude sessions from ~/.claude/projects/."""
+    """`/sessions` — list recent claude sessions from ~/.claude/projects/.
+
+    Two bugs the prior version had:
+      1) Claude Code writes a `queue-operation` line BEFORE the first
+         `user` message. The old handler read only the first line and
+         bailed on the type check, so every Claude-bot session was
+         silently skipped.
+      2) `rglob` picked up subagent JSONLs which share the parent
+         sessionId, so the same session appeared 6+ times.
+    The fix: walk lines until we find a user message; skip /subagents/.
+    """
     chat_id = update.message.chat_id
     if not CLAUDE_PROJECTS_DIR.exists():
         await update.message.reply_text("no claude session history found", do_quote=True)
         return
 
-    # Find session JSONL files (each is a saved session)
     sessions = []
     for jsonl in CLAUDE_PROJECTS_DIR.rglob("*.jsonl"):
+        # Skip subagent JSONLs — they share sessionId with their parent
+        # and would clutter the list with duplicates.
+        if "/subagents/" in str(jsonl):
+            continue
         try:
             stat = jsonl.stat()
             if stat.st_size == 0:
                 continue
-            # First line of session JSONL has session metadata
+            sid: str | None = None
+            preview = ""
             with open(jsonl) as f:
-                first_line = f.readline()
-            if not first_line.strip():
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    # First event with a sessionId establishes which session this is
+                    if sid is None:
+                        sid = ev.get("sessionId") or jsonl.stem
+                    # Find the first user message for the preview text.
+                    # Claude Code may write queue-operation/dequeue lines
+                    # BEFORE the first user message, so don't bail early.
+                    if not preview and ev.get("type") == "user":
+                        msg = ev.get("message", {})
+                        content = msg.get("content", "")
+                        if isinstance(content, list):
+                            content = "\n".join(
+                                b.get("text", "") for b in content if b.get("type") == "text"
+                            )
+                        preview = (content or "").strip()
+            if not sid or not preview:
                 continue
-            meta = json.loads(first_line)
-            if meta.get("type") != "user":
-                continue
-            sid = meta.get("sessionId", jsonl.stem)
-            msg = meta.get("message", {})
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                content = "\n".join(b.get("text","") for b in content if b.get("type") == "text")
-            preview = (content or "(empty)")[:80].replace("\n", " ")
             sessions.append({
                 "id": sid,
                 "ts": stat.st_mtime,
@@ -1778,23 +1803,26 @@ async def handle_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
 
     if not sessions:
-        await update.message.reply_text("no parseable sessions found", do_quote=True)
+        await update.message.reply_text(
+            "no parseable sessions found. Have you started any claude sessions yet?",
+            do_quote=True,
+        )
         return
 
     # Sort newest first, limit to 15
     sessions.sort(key=lambda s: s["ts"], reverse=True)
     sessions = sessions[:15]
 
-    lines = [f"📂 *Recent sessions* ({len(sessions)}):\n"]
+    lines = [f"📂 *Recent sessions* ({len(sessions)}):", ""]
+    from datetime import datetime as _dt
     for s in sessions:
-        from datetime import datetime as _dt
         age = _dt.fromtimestamp(s["ts"]).strftime("%Y-%m-%d %H:%M")
-        # s['preview'] is user-controlled (first line of session transcript).
-        # Escape it so underscore/asterisk/bracket inside preview can't
-        # break the entire Markdown message ("Can't find end of entity").
-        lines.append(f"`{s['id'][:8]}`  {age}  {md_escape(s['preview'])}")
-
-    lines.append("\nUse `/resume <id>` to continue one.")
+        # s['preview'] is user-controlled (first user message). Escape it
+        # so underscore/asterisk/bracket inside can't break the entire
+        # Markdown message ("Can't find end of entity").
+        lines.append(f"`{s['id'][:8]}`  {age}  {md_escape(s['preview'][:80])}")
+    lines.append("")
+    lines.append("Use `/resume <id>` to continue one.")
     await safe_send(update, "\n".join(lines))
 
 
